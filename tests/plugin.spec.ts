@@ -9275,6 +9275,72 @@ test('issue.linkGitHubItem links an issue in an unmapped project when the reposi
   }
 });
 
+test('issue.linkGitHubItem lets a mapped project link an issue in another named repository', async () => {
+  const harness = await createProjectPullRequestsHarness();
+  const originalFetch = globalThis.fetch;
+  const issue = await harness.ctx.issues.create({
+    companyId: 'company-1',
+    projectId: 'project-1',
+    title: 'Work that spans two repositories'
+  });
+
+  globalThis.fetch = async (input, init) => {
+    const requestUrl = getRequestUrl(input);
+    const requestPathname = getDecodedRequestPathname(input);
+
+    if (requestPathname === '/repos/paperclipai/second-repo/issues/5') {
+      return jsonResponse({
+        id: 500,
+        number: 5,
+        title: 'Second repository half of the work',
+        body: '',
+        html_url: 'https://github.com/paperclipai/second-repo/issues/5',
+        state: 'open',
+        state_reason: null,
+        comments: 0,
+        user: { login: 'octocat', html_url: 'https://github.com/octocat', avatar_url: 'https://avatars.githubusercontent.com/u/583231?v=4' },
+        labels: []
+      });
+    }
+
+    if (requestPathname === '/graphql') {
+      const { query, variables } = getGraphqlRequest(init);
+      if (query.includes('query GitHubIssueStatusSnapshot') && variables.issueNumber === 5) {
+        return graphqlResponse({
+          repository: {
+            issue: {
+              closedByPullRequestsReferences: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] },
+              comments: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
+            }
+          }
+        });
+      }
+    }
+
+    throw new Error(`Unexpected fetch during cross-repository link test: ${requestUrl}`);
+  };
+
+  try {
+    const result = await harness.performAction<{ githubIssueNumber?: number }>('issue.linkGitHubItem', {
+      companyId: 'company-1',
+      issueId: issue.id,
+      kind: 'issue',
+      repository: 'paperclipai/second-repo',
+      reference: '5'
+    });
+    assert.equal(result.githubIssueNumber, 5);
+
+    const issueLinks = await harness.ctx.entities.list({
+      entityType: 'paperclip-github-plugin.issue-link',
+      scopeKind: 'issue',
+      scopeId: issue.id
+    });
+    assert.equal(issueLinks[0]?.externalId, 'https://github.com/paperclipai/second-repo/issues/5');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('issue.linkGitHubItem still requires a repository when the project is not mapped', async () => {
   const harness = await createProjectPullRequestsHarness();
   const issue = await harness.ctx.issues.create({
