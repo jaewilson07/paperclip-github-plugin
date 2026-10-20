@@ -13,6 +13,7 @@ const ISSUE_INTERACTION_ACTIONS = new Set([
   'assign_to_current_user',
   'create_pull_request',
   'link_github_item',
+  'push_issue_to_github',
   'reply_to_review_thread',
   'request_pull_request_reviewers',
   'resolve_review_thread',

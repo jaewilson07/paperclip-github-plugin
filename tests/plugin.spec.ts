@@ -2206,6 +2206,7 @@ test('manifest declares GitHub agent tools and only the external metrics API rou
       'add_pull_request_to_project',
       'upload_pull_request_asset',
       'link_github_item',
+      'push_issue_to_github',
       'get_issue_interaction_summary'
     ]
   );

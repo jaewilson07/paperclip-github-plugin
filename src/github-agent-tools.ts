@@ -694,6 +694,26 @@ export const GITHUB_AGENT_TOOLS: PluginToolDeclaration[] = [
     }
   },
   {
+    name: 'push_issue_to_github',
+    displayName: 'Push Issue To GitHub',
+    description: 'Create a GitHub issue in the repository mapped to the Paperclip issue project, with the Paperclip identifier in its body, and store the link. Pushing an issue that is already linked changes nothing and returns the existing link.',
+    parametersSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['paperclipIssueId'],
+      properties: {
+        paperclipIssueId: {
+          type: 'string',
+          description: 'Paperclip issue id to push to GitHub.'
+        },
+        repository: {
+          type: 'string',
+          description: 'GitHub repository as owner/repo. Only needed when the Paperclip project maps more than one repository.'
+        }
+      }
+    }
+  },
+  {
     name: 'get_issue_interaction_summary',
     displayName: 'Get Issue Interaction Summary',
     description: 'Return a deterministic, sanitized interaction summary for one Paperclip issue over a maximum 30-day [from,to) UTC range.',
