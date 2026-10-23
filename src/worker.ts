@@ -41,6 +41,21 @@ import {
   GITHUB_SYNC_PLUGIN_ID,
 } from './kpi-contract.ts';
 import { normalizePaperclipHealthResponse, requiresPaperclipBoardAccess } from './paperclip-health.ts';
+import {
+  ForgeItemAlreadyLinkedError,
+  forgeItemKey,
+  type ForgeItemRef,
+  type ForgeLink,
+  type ForgeLinkStore
+} from './forge-link.ts';
+import {
+  bodyHasPushMarker,
+  PushIssueRefusedError,
+  pushIssueToGitHub,
+  type PushedGitHubIssue,
+  type PushIssueDeps,
+  type PushIssueResult
+} from './push-issue.ts';
 
 const GITHUB_SYNC_BASE_ORIGIN_KIND = `plugin:${GITHUB_SYNC_PLUGIN_ID}` as const;
 const GITHUB_ISSUE_ORIGIN_KIND = `plugin:${GITHUB_SYNC_PLUGIN_ID}:github-issue` as const;
@@ -12383,6 +12398,245 @@ async function linkPaperclipIssueToGitHubPullRequest(
   };
 }
 
+const GITHUB_FORGE_HOST = 'github.com';
+
+function forgeLinkFromGitHubIssueRecord(record: GitHubIssueLinkRecord): ForgeLink | null {
+  const repository = parseRepositoryReference(record.data.repositoryUrl);
+  if (!repository) {
+    return null;
+  }
+
+  return {
+    forge: 'github',
+    host: GITHUB_FORGE_HOST,
+    repository: `${repository.owner}/${repository.repo}`.toLowerCase(),
+    number: record.data.githubIssueNumber,
+    kind: 'issue',
+    url: record.data.githubIssueUrl
+  };
+}
+
+/**
+ * Stopgap `ForgeLinkStore` over the plugin's existing GitHub issue-link entities, so push works
+ * before DAT-1427 lands the real store. `put` is find-then-write, not atomic, and needs the
+ * created GitHub issue in `githubIssues`. Replace with the DAT-1427 store when it merges.
+ */
+function createInterimGitHubForgeLinkStore(
+  ctx: PluginSetupContext,
+  params: {
+    companyId: string;
+    githubIssues: Map<number, GitHubIssueRecord>;
+    /** Filled in once the project's repository is resolved; only `put` needs it. */
+    target: { projectId?: string; mapping?: RepositoryMapping; repositoryUrl?: string };
+  }
+): ForgeLinkStore {
+  const isThisCompany = (record: GitHubIssueLinkRecord) =>
+    !record.data.companyId || record.data.companyId === params.companyId;
+
+  const store: ForgeLinkStore = {
+    async list(paperclipIssueId) {
+      const records = await listGitHubIssueLinkRecords(ctx, { paperclipIssueId });
+      return records
+        .filter((record) => record.status !== 'unlinked' && isThisCompany(record))
+        .map(forgeLinkFromGitHubIssueRecord)
+        .filter((link): link is ForgeLink => link !== null);
+    },
+    async put(paperclipIssueId, link) {
+      const key = forgeItemKey(link);
+      const owner = await store.findPaperclipIssue(link);
+      if (owner !== undefined && owner !== paperclipIssueId) {
+        throw new ForgeItemAlreadyLinkedError(link, owner);
+      }
+      const existing = (await store.list(paperclipIssueId)).find((entry) => forgeItemKey(entry) === key);
+      if (existing) {
+        return { link: existing, created: false };
+      }
+
+      const githubIssue = params.githubIssues.get(link.number);
+      const { projectId, mapping, repositoryUrl } = params.target;
+      if (!githubIssue || !repositoryUrl) {
+        throw new Error(`GitHub issue #${link.number} was not fetched before linking.`);
+      }
+      await upsertGitHubIssueLinkRecord(
+        ctx,
+        {
+          companyId: params.companyId,
+          ...(projectId ? { paperclipProjectId: projectId } : {}),
+          repositoryUrl
+        },
+        paperclipIssueId,
+        githubIssue,
+        []
+      );
+      await rememberExternalGitHubLinkCompany(ctx, params.companyId);
+      if (mapping) {
+        // Record the import so the next sync does not create a second Paperclip issue for it.
+        const importRegistry = normalizeImportRegistry(await ctx.state.get(IMPORT_REGISTRY_SCOPE));
+        upsertImportedIssueRecord(
+          importRegistry,
+          buildImportedIssueRecord(mapping, githubIssue, paperclipIssueId, new Date().toISOString())
+        );
+        await ctx.state.set(IMPORT_REGISTRY_SCOPE, importRegistry);
+      }
+      return { link: { ...link }, created: true };
+    },
+    async remove(paperclipIssueId, item: ForgeItemRef) {
+      const key = forgeItemKey(item);
+      const records = await listGitHubIssueLinkRecords(ctx, { paperclipIssueId });
+      for (const record of records) {
+        const link = forgeLinkFromGitHubIssueRecord(record);
+        if (link && record.status !== 'unlinked' && forgeItemKey(link) === key) {
+          await tombstoneGitHubIssueLinkRecord(ctx, record, new Date().toISOString());
+        }
+      }
+    },
+    async findPaperclipIssue(item) {
+      const key = forgeItemKey(item);
+      const records = await listGitHubIssueLinkRecords(ctx);
+      for (const record of records) {
+        const link = forgeLinkFromGitHubIssueRecord(record);
+        if (link && record.status !== 'unlinked' && isThisCompany(record) && forgeItemKey(link) === key) {
+          return record.paperclipIssueId;
+        }
+      }
+      return undefined;
+    }
+  };
+  return store;
+}
+
+async function pushPaperclipIssueToGitHub(
+  ctx: PluginSetupContext,
+  params: {
+    companyId: string;
+    issueId: string;
+    repositoryUrl?: string;
+  }
+): Promise<PushIssueResult & { repositoryUrl: string }> {
+  const companyId = normalizeCompanyId(params.companyId);
+  const issueId = normalizeOptionalString(params.issueId);
+  if (!companyId || !issueId) {
+    throw new Error('companyId and issueId are required.');
+  }
+
+  const target: { projectId?: string; mapping?: RepositoryMapping; repositoryUrl?: string } = {};
+  let repository: ParsedRepositoryReference | undefined;
+  const githubIssues = new Map<number, GitHubIssueRecord>();
+  let octokit: Octokit | undefined;
+  const getOctokit = async () => {
+    octokit ??= await createGitHubToolOctokit(ctx, companyId);
+    return octokit;
+  };
+  const toPushed = (raw: GitHubApiIssueRecord): PushedGitHubIssue => {
+    githubIssues.set(raw.number, normalizeGitHubIssueRecord(raw));
+    return {
+      number: raw.number,
+      url: normalizeGitHubIssueHtmlUrl(raw.html_url) ?? raw.html_url,
+      body: raw.body ?? null
+    };
+  };
+
+  const deps: PushIssueDeps = {
+    store: createInterimGitHubForgeLinkStore(ctx, { companyId, githubIssues, target }),
+    async getIssue(id) {
+      const issue = await ctx.issues.get(id, companyId);
+      if (!issue) {
+        return null;
+      }
+      const projectId = typeof issue.projectId === 'string' && issue.projectId.trim() ? issue.projectId.trim() : undefined;
+      if (projectId) {
+        target.projectId = projectId;
+      }
+      return {
+        id: issue.id,
+        identifier: issue.identifier ?? '',
+        title: issue.title,
+        description: issue.description ?? null,
+        projectId: projectId ?? null
+      };
+    },
+    async resolveRepository(issue, requested) {
+      if (!issue.projectId) {
+        throw new PushIssueRefusedError(
+          `Paperclip issue ${issue.identifier} is not in a project, so there is no GitHub repository to push to.`
+        );
+      }
+      const settings = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
+      const mappings = await resolveProjectScopedMappings(ctx, settings.mappings, {
+        companyId,
+        projectId: issue.projectId
+      });
+      if (mappings.length === 0) {
+        throw new PushIssueRefusedError(
+          `The Paperclip project of ${issue.identifier} has no GitHub repository. Map a repository to the project in the GitHub Sync settings, then push again.`
+        );
+      }
+      const wanted = requested ? requireRepositoryReference(requested) : null;
+      const matching = wanted
+        ? mappings.filter((entry) => areRepositoriesEqual(requireRepositoryReference(entry.repositoryUrl), wanted))
+        : mappings;
+      if (matching.length === 0) {
+        throw new PushIssueRefusedError(
+          `The Paperclip project of ${issue.identifier} is not mapped to ${requested}.`
+        );
+      }
+      if (matching.length > 1) {
+        throw new PushIssueRefusedError(
+          `The Paperclip project of ${issue.identifier} maps more than one GitHub repository. Pass repository as owner/repo.`
+        );
+      }
+      target.mapping = matching[0];
+      repository = requireRepositoryReference(matching[0].repositoryUrl);
+      target.repositoryUrl = repository.url;
+      return { host: GITHUB_FORGE_HOST, repository: `${repository.owner}/${repository.repo}` };
+    },
+    async findIssueByMarker(_target, marker) {
+      const client = await getOctokit();
+      const response = await client.rest.search.issuesAndPullRequests({
+        q: `"${marker}" repo:${repository!.owner}/${repository!.repo} in:body type:issue`,
+        per_page: 20,
+        headers: { 'X-GitHub-Api-Version': GITHUB_API_VERSION }
+      });
+      return (response.data.items as unknown as GitHubApiIssueRecord[])
+        .filter((item) => !item.pull_request)
+        .map(toPushed);
+    },
+    async createIssue(_target, input) {
+      const client = await getOctokit();
+      const response = await client.rest.issues.create({
+        owner: repository!.owner,
+        repo: repository!.repo,
+        title: input.title,
+        body: input.body,
+        headers: { 'X-GitHub-Api-Version': GITHUB_API_VERSION }
+      });
+      return toPushed(response.data as unknown as GitHubApiIssueRecord);
+    }
+  };
+
+  const result = await pushIssueToGitHub(deps, { paperclipIssueId: issueId, repository: params.repositoryUrl });
+  if (!repository) {
+    // Existing link: the repository was never resolved, take it from the stored link.
+    const linked = parseRepositoryReference(result.link.repository);
+    repository = linked ?? undefined;
+  }
+
+  return { ...result, repositoryUrl: repository?.url ?? `https://github.com/${result.link.repository}` };
+}
+
+function describePushResult(
+  paperclipIssueId: string,
+  result: PushIssueResult & { repositoryUrl: string }
+): Record<string, unknown> {
+  return {
+    created: result.created,
+    paperclipIssueId,
+    repositoryUrl: result.repositoryUrl,
+    githubIssueNumber: result.link.number,
+    githubIssueUrl: result.link.url
+  };
+}
+
 function invalidateGitHubLinkCachesForTarget(params: {
   companyId?: string;
   projectId?: string;
@@ -23266,7 +23520,7 @@ async function executeTrackedGitHubMutation(
       companyId: runCtx.companyId,
       paperclipIssueId,
       occurredAt: startedAt.toISOString(),
-      category: action === 'link_github_item'
+      category: action === 'link_github_item' || action === 'push_issue_to_github'
         ? 'paperclip_link'
         : action.includes('comment') || action.includes('reply') ? 'comment' : 'github_write',
       action,
@@ -23292,7 +23546,7 @@ async function executeTrackedGitHubMutation(
         companyId: runCtx.companyId,
         paperclipIssueId,
         occurredAt: startedAt.toISOString(),
-        category: action === 'link_github_item'
+        category: action === 'link_github_item' || action === 'push_issue_to_github'
           ? 'paperclip_link'
           : action.includes('comment') || action.includes('reply') ? 'comment' : 'github_write',
         action,
@@ -24695,6 +24949,30 @@ function registerGitHubAgentTools(ctx: PluginSetupContext): void {
   );
 
   ctx.tools.register(
+    'push_issue_to_github',
+    getGitHubAgentToolDeclaration('push_issue_to_github'),
+    async (params, runCtx) => executeTrackedGitHubMutation(ctx, 'push_issue_to_github', params, runCtx, async () => {
+      const input = getToolInputRecord(params);
+      const paperclipIssueId = normalizeOptionalToolString(input.paperclipIssueId);
+      if (!paperclipIssueId) {
+        throw new Error('paperclipIssueId is required.');
+      }
+
+      const result = await pushPaperclipIssueToGitHub(ctx, {
+        companyId: runCtx.companyId,
+        issueId: paperclipIssueId,
+        repositoryUrl: normalizeOptionalToolString(input.repository)
+      });
+      return buildToolSuccessResult(
+        result.created
+          ? `Pushed Paperclip issue ${paperclipIssueId} to GitHub issue #${result.link.number}.`
+          : `Paperclip issue ${paperclipIssueId} is already linked to GitHub issue #${result.link.number}.`,
+        describePushResult(paperclipIssueId, result)
+      );
+    })
+  );
+
+  ctx.tools.register(
     'get_issue_interaction_summary',
     getGitHubAgentToolDeclaration('get_issue_interaction_summary'),
     async (params, runCtx) => executeGitHubTool(async () => {
@@ -24950,6 +25228,21 @@ const plugin = definePlugin({
             requireUnlinked: true,
             followThroughAssigneeAgentId: record.followThroughAssigneeAgentId
           });
+    });
+
+    ctx.actions.register('issue.pushToGitHub', async (input, actionContext) => {
+      const record = normalizeActionRecord(input, actionContext);
+      const companyId = normalizeCompanyId(record.companyId);
+      const issueId = normalizeOptionalString(record.issueId);
+      if (!companyId || !issueId) {
+        throw new Error('companyId and issueId are required.');
+      }
+
+      return describePushResult(issueId, await pushPaperclipIssueToGitHub(ctx, {
+        companyId,
+        issueId,
+        repositoryUrl: normalizeOptionalString(record.repository)
+      }));
     });
 
     ctx.actions.register('issue.unlinkGitHubItem', async (input, actionContext) => {

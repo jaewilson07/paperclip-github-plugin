@@ -323,6 +323,7 @@ paperclip-github-plugin:list_organization_projects
 paperclip-github-plugin:add_pull_request_to_project
 paperclip-github-plugin:upload_pull_request_asset
 paperclip-github-plugin:link_github_item
+paperclip-github-plugin:push_issue_to_github
 paperclip-github-plugin:get_issue_interaction_summary
 ```
 
@@ -483,6 +484,8 @@ Example tool payload:
 The tool result contains `asset.markdown`, `asset.rawUrl`, `asset.artifactBranch`, `asset.path`, and `asset.commitSha`.
 
 ### Issue link tool
+
+Agents can create the GitHub side of a Paperclip issue with `push_issue_to_github` (hosted action: `issue.pushToGitHub`). It creates one issue in the repository mapped to the Paperclip issue's project, writes `Paperclip issue: <identifier>` as the first line of the body, and stores the link. Pushing an issue that already has a GitHub issue link changes nothing and returns the existing link (`created: false`). A project with no mapped repository is refused with a message saying so; pass `repository` when a project maps more than one.
 
 Authenticated agent runs can link the current Paperclip issue to a GitHub issue or pull request by calling the `link_github_item` tool. This is useful after creating a PR with `gh` in a repository that is not mapped to a Paperclip project.
 
