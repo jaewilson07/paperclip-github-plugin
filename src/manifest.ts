@@ -88,6 +88,13 @@ export const manifest: PaperclipPluginManifestV1 = {
       paperclipApiBaseUrl: {
         type: 'string',
         title: 'Trusted Paperclip API Origin'
+      },
+      importMaxAgeDays: {
+        type: 'integer',
+        minimum: 1,
+        maximum: 3650,
+        title: 'Import Max Age (days)',
+        description: 'Only import open GitHub issues updated within this many days. Unset imports every open issue. Issues already imported or linked keep syncing at any age. Set per company in advanced settings and per repository mapping in the settings page.'
       }
     }
   },
