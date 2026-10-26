@@ -19902,6 +19902,212 @@ test('worker resyncs imported issue descriptions when the GitHub body changes la
   }
 });
 
+test('worker reports description drift instead of overwriting an edited Paperclip description', async () => {
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRef: 'github-secret-ref'
+    }
+  });
+  await plugin.definition.setup(harness.ctx);
+
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      {
+        id: 'mapping-a',
+        repositoryUrl: 'paperclipai/example-repo',
+        paperclipProjectName: 'Engineering',
+        paperclipProjectId: 'project-1',
+        companyId: 'company-1'
+      }
+    ],
+    syncState: {
+      status: 'idle'
+    }
+  });
+
+  const statusTransitionComments: Array<{ issueId: string; body: string }> = [];
+  const originalCreateComment = harness.ctx.issues.createComment;
+  harness.ctx.issues.createComment = async (issueId, body, companyId) => {
+    statusTransitionComments.push({ issueId, body });
+    return originalCreateComment(issueId, body, companyId);
+  };
+
+  let syncRun = 0;
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (input, init) => {
+    const rawUrl = getRequestUrl(input);
+    const url = new URL(rawUrl);
+
+    if (url.pathname === '/repos/paperclipai/example-repo/issues' && ['all', 'open'].includes(url.searchParams.get('state') ?? '')) {
+      return jsonResponse([
+        {
+          id: 2601,
+          number: 26,
+          title: 'Description drift after edit',
+          body: syncRun === 0 ? 'Original body' : 'Updated body from GitHub',
+          html_url: 'https://github.com/paperclipai/example-repo/issues/26',
+          state: 'open'
+        }
+      ]);
+    }
+
+    if (url.pathname === '/graphql') {
+      const { query, variables } = getGraphqlRequest(init);
+      const issueNumber = typeof variables.issueNumber === 'number' ? variables.issueNumber : undefined;
+
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([
+          {
+            issueNumber: 26
+          }
+        ]);
+      }
+
+      if (query.includes('query GitHubIssueStatusSnapshot') && issueNumber === 26) {
+        return graphqlResponse({
+          repository: {
+            issue: {
+              number: 26,
+              state: 'OPEN',
+              stateReason: null,
+              comments: {
+                totalCount: 0
+              },
+              closedByPullRequestsReferences: {
+                pageInfo: {
+                  hasNextPage: false,
+                  endCursor: null
+                },
+                nodes: [
+                  {
+                    number: 260,
+                    state: 'OPEN'
+                  }
+                ]
+              }
+            }
+          }
+        });
+      }
+
+      if (query.includes('query GitHubPullRequestReviewThreads')) {
+        return graphqlResponse({
+          repository: {
+            pullRequest: {
+              reviewThreads: {
+                pageInfo: {
+                  hasNextPage: false,
+                  endCursor: null
+                },
+                nodes: [{ isResolved: true }]
+              }
+            }
+          }
+        });
+      }
+
+      if (query.includes('query GitHubPullRequestCiContexts')) {
+        return graphqlResponse({
+          repository: {
+            pullRequest: {
+              statusCheckRollup: {
+                contexts: {
+                  pageInfo: {
+                    hasNextPage: false,
+                    endCursor: null
+                  },
+                  nodes: [
+                    {
+                      __typename: 'StatusContext',
+                      state: 'SUCCESS'
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        });
+      }
+    }
+
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  try {
+    const firstSync = await harness.performAction('sync.runNow', {}) as {
+      syncState: { status: string; message?: string };
+    };
+
+    assert.equal(firstSync.syncState.status, 'success');
+
+    const importedIssue = (await harness.ctx.issues.list({
+      companyId: 'company-1'
+    })).find((issue) => issue.title === 'Description drift after edit');
+
+    assert.ok(importedIssue);
+    assert.doesNotMatch(importedIssue?.description ?? '', /^\*\s+GitHub issue:/m);
+    assert.match(importedIssue?.description ?? '', /Original body/);
+    assert.equal(statusTransitionComments.length, 1);
+
+    const githubDetailsAfterFirstSync = await harness.getData<{
+      githubIssueNumber: number;
+      linkedPullRequestNumbers: number[];
+    } | null>('issue.githubDetails', {
+      companyId: 'company-1',
+      issueId: importedIssue?.id
+    });
+
+    assert.equal(githubDetailsAfterFirstSync?.githubIssueNumber, 26);
+    assert.deepEqual(githubDetailsAfterFirstSync?.linkedPullRequestNumbers, [260]);
+
+    const driftComments = () => statusTransitionComments.filter((comment) => comment.body.includes('GitHub Sync: description drift'));
+    const findIssue = async () => (await harness.ctx.issues.list({ companyId: 'company-1' }))
+      .find((issue) => issue.title === 'Description drift after edit');
+
+    // Unedited Paperclip text keeps syncing from GitHub as before.
+    assert.equal(driftComments().length, 0);
+
+    // An owner edits the Paperclip description, then GitHub changes too.
+    const editedDescription = `${importedIssue.description}\n\nOwner notes that must not be lost`;
+    await harness.ctx.issues.update(importedIssue.id, { description: editedDescription }, 'company-1');
+    syncRun = 1;
+
+    const secondSync = await harness.performAction('sync.runNow', {}) as {
+      syncState: { status: string; message?: string };
+    };
+    assert.equal(secondSync.syncState.status, 'success');
+    assert.match(secondSync.syncState.message ?? '', /left 1 drifted issue description untouched/);
+    assert.doesNotMatch(secondSync.syncState.message ?? '', /updated [1-9]\d* issue description/);
+    assert.equal((await findIssue())?.description, editedDescription);
+    assert.equal(driftComments().length, 1);
+    assert.match(driftComments()[0].body, /Owner notes that must not be lost/);
+    assert.match(driftComments()[0].body, /Updated body from GitHub/);
+
+    // The same pair of texts is not reported twice.
+    await harness.performAction('sync.runNow', {});
+    assert.equal(driftComments().length, 1);
+    assert.equal((await findIssue())?.description, editedDescription);
+
+    // "Accept GitHub" resumes description sync.
+    await harness.performAction('issue.acceptGitHubDescription', {
+      companyId: 'company-1',
+      issueId: importedIssue.id
+    });
+    const afterAccept = await harness.performAction('sync.runNow', {}) as {
+      syncState: { status: string; message?: string };
+    };
+    assert.match(afterAccept.syncState.message ?? '', /updated 1 issue description/);
+    const accepted = await findIssue();
+    assert.match(accepted?.description ?? '', /Updated body from GitHub/);
+    assert.doesNotMatch(accepted?.description ?? '', /Owner notes/);
+    assert.equal(driftComments().length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('get_issue resolves imported Paperclip issues from the hidden description marker when registry and entities are missing', async () => {
   const harness = await createGitHubAgentToolHarness();
   const originalFetch = globalThis.fetch;

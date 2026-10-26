@@ -177,6 +177,10 @@ Imported issues keep the original GitHub title and use the normalized GitHub bod
 
 To keep imported issues recognizable without cluttering the visible description, the plugin appends a hidden HTML comment footer with the source GitHub issue URL. Agents and repair flows use that marker when the plugin-owned link entity or import registry is missing.
 
+### Description drift
+
+Sync is one-way: GitHub to Paperclip. The plugin never writes to GitHub. It records a hash of the description it last wrote for each linked issue. If the Paperclip description no longer matches that hash (someone edited it), the sync skips the description, keeps syncing labels and status, and posts one comment with the Paperclip text and the GitHub text. The same pair of texts is not reported twice. The owning agent resolves it: move the extra text into a comment and use **Accept GitHub description** on the issue's GitHub tab, or change the GitHub body so the two match. The sync summary reports how many descriptions were left untouched. Issues with no stored hash (first sync after upgrading) adopt their current text as the baseline and are not reported as drift. Put durable instructions for linked issues in the GitHub body or in comments, not the Paperclip description.
+
 Repeated syncs keep existing imports current instead of creating duplicates again. If the plugin's import registry is stale, the worker can repair deduplication by reusing existing Paperclip issues when durable GitHub link metadata is already present.
 
 If a linked GitHub issue is transferred to another repository, GitHub Sync follows the canonical GitHub URL. When the destination repository is mapped to another Paperclip project in the same company, the existing Paperclip issue moves to that project and keeps its GitHub link. When the destination repository is not mapped, GitHub Sync unlinks the Paperclip issue and marks it `cancelled` with a Paperclip comment explaining the transfer.

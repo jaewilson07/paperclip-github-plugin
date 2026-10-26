@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { createHash, randomUUID } from 'node:crypto';
+import { buildDescriptionDriftComment, decideDescriptionDrift, hashDescription } from './description-drift.ts';
 import { realpathSync } from 'node:fs';
 import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -432,6 +433,10 @@ interface ImportedIssueRecord {
   /** External PR state the last time sync pulled this issue out of `blocked`. See shouldPreserveDeliberateBlockedWait. */
   unblockedExternalStateHash?: string;
   activationPending?: boolean;
+  /** Hash of the Paperclip description the plugin last wrote or adopted. A different hash means someone edited it. */
+  descriptionHash?: string;
+  /** Hash pair of the texts a description-drift comment was last posted for. */
+  descriptionDriftKey?: string;
   repositoryUrl?: string;
   paperclipProjectId?: string;
   companyId?: string;
@@ -7036,6 +7041,8 @@ function normalizeImportRegistry(value: unknown): ImportedIssueRecord[] {
       const selectedPullRequestGate = normalizeSelectedPullRequestGate(record.selectedPullRequestGate);
       const pendingRemoteActionWake = normalizePendingRemoteActionWake(record.pendingRemoteActionWake);
       const activationPending = record.activationPending === true;
+      const descriptionHash = typeof record.descriptionHash === 'string' && record.descriptionHash ? record.descriptionHash : undefined;
+      const descriptionDriftKey = typeof record.descriptionDriftKey === 'string' && record.descriptionDriftKey ? record.descriptionDriftKey : undefined;
 
       if (!mappingId || Number.isNaN(githubIssueId) || !paperclipIssueId || !importedAt) {
         return null;
@@ -7056,7 +7063,9 @@ function normalizeImportRegistry(value: unknown): ImportedIssueRecord[] {
         ...(remoteActionFingerprint ? { remoteActionFingerprint } : {}),
         ...(selectedPullRequestGate ? { selectedPullRequestGate } : {}),
         ...(pendingRemoteActionWake ? { pendingRemoteActionWake } : {}),
-        ...(activationPending ? { activationPending: true } : {})
+        ...(activationPending ? { activationPending: true } : {}),
+        ...(descriptionHash ? { descriptionHash } : {}),
+        ...(descriptionDriftKey ? { descriptionDriftKey } : {})
       };
     })
     .filter((entry): entry is ImportedIssueRecord => entry !== null);
@@ -13669,6 +13678,76 @@ async function synchronizePaperclipIssueLabels(
   return true;
 }
 
+/**
+ * One-way description sync with drift protection. GitHub stays the source and nothing is written to GitHub.
+ * If the Paperclip description was edited since the plugin last wrote it, the description is left alone and
+ * one comment records both texts for the owning agent to resolve.
+ */
+async function synchronizePaperclipIssueDescriptionWithDriftGuard(
+  ctx: PluginSetupContext,
+  params: {
+    companyId: string;
+    importedIssue: ImportedIssueRecord;
+    currentDescription?: string | null;
+    githubIssue: GitHubIssueRecord;
+    linkedPullRequestNumbers: number[];
+    paperclipApiBaseUrl?: string;
+    persistImportRegistry: () => Promise<void>;
+  }
+): Promise<{ updated: boolean; drifted: boolean }> {
+  const { importedIssue, githubIssue } = params;
+  const nextDescription = buildPaperclipIssueDescription(githubIssue, params.linkedPullRequestNumbers);
+  const decision = decideDescriptionDrift({
+    currentDescription: params.currentDescription,
+    nextDescription,
+    storedHash: importedIssue.descriptionHash,
+    storedDriftKey: importedIssue.descriptionDriftKey
+  });
+
+  if (decision.action === 'drift') {
+    if (decision.report) {
+      if (!ctx.issues || typeof ctx.issues.createComment !== 'function') {
+        // Without a way to report it, still never overwrite.
+        return { updated: false, drifted: true };
+      }
+      await ctx.issues.createComment(
+        importedIssue.paperclipIssueId,
+        buildDescriptionDriftComment({
+          githubIssueUrl: githubIssue.htmlUrl,
+          paperclipDescription: params.currentDescription,
+          githubDescription: nextDescription
+        }),
+        params.companyId
+      );
+      importedIssue.descriptionDriftKey = decision.driftKey;
+      await params.persistImportRegistry();
+    }
+    return { updated: false, drifted: true };
+  }
+
+  const updated = decision.action === 'write'
+    ? await synchronizePaperclipIssueDescription(ctx, {
+        companyId: params.companyId,
+        issueId: importedIssue.paperclipIssueId,
+        currentDescription: params.currentDescription,
+        githubIssue,
+        linkedPullRequestNumbers: params.linkedPullRequestNumbers,
+        paperclipApiBaseUrl: params.paperclipApiBaseUrl
+      })
+    : false;
+
+  // An unsuccessful write leaves the old hash alone so the next sync can retry.
+  if (decision.action === 'in_sync' || updated) {
+    const nextHash = hashDescription(nextDescription);
+    if (importedIssue.descriptionHash !== nextHash || importedIssue.descriptionDriftKey !== undefined) {
+      importedIssue.descriptionHash = nextHash;
+      delete importedIssue.descriptionDriftKey;
+      await params.persistImportRegistry();
+    }
+  }
+  return { updated, drifted: false };
+}
+
 async function synchronizePaperclipIssueDescription(
   ctx: PluginSetupContext,
   params: {
@@ -15255,6 +15334,7 @@ async function synchronizePaperclipIssueStatuses(
   updatedStatusesCount: number;
   updatedLabelsCount: number;
   updatedDescriptionsCount: number;
+  driftedDescriptionsCount: number;
 }> {
   if (
     !mapping.companyId ||
@@ -15265,13 +15345,15 @@ async function synchronizePaperclipIssueStatuses(
     return {
       updatedStatusesCount: 0,
       updatedLabelsCount: 0,
-      updatedDescriptionsCount: 0
+      updatedDescriptionsCount: 0,
+      driftedDescriptionsCount: 0
     };
   }
 
   let updatedStatusesCount = 0;
   let updatedLabelsCount = 0;
   let updatedDescriptionsCount = 0;
+  let driftedDescriptionsCount = 0;
   let completedIssueCount = 0;
   const totalIssueCount = importedIssues.length;
   const queuedIssueWakeups: Array<{
@@ -15330,19 +15412,17 @@ async function synchronizePaperclipIssueStatuses(
           repositoryUrl: repository.url,
           githubIssueNumber: githubIssue.number
         });
-        if (
-          await synchronizePaperclipIssueDescription(
-            ctx,
-            {
-              companyId: mapping.companyId,
-              issueId: importedIssue.paperclipIssueId,
-              currentDescription,
-              githubIssue,
-              linkedPullRequestNumbers: warmedLinkedPullRequestNumbers,
-              paperclipApiBaseUrl
-            }
-          )
-        ) {
+        const warmedDescriptionResult = await synchronizePaperclipIssueDescriptionWithDriftGuard(ctx, {
+          companyId: mapping.companyId,
+          importedIssue,
+          currentDescription,
+          githubIssue,
+          linkedPullRequestNumbers: warmedLinkedPullRequestNumbers,
+          paperclipApiBaseUrl,
+          persistImportRegistry
+        });
+        let descriptionDrifted = warmedDescriptionResult.drifted;
+        if (warmedDescriptionResult.updated) {
           descriptionUpdated = true;
           currentDescription = buildPaperclipIssueDescription(githubIssue, warmedLinkedPullRequestNumbers);
         }
@@ -15370,19 +15450,17 @@ async function synchronizePaperclipIssueStatuses(
           repositoryUrl: repository.url,
           githubIssueNumber: githubIssue.number
         });
-        if (
-          await synchronizePaperclipIssueDescription(
-            ctx,
-            {
-              companyId: mapping.companyId,
-              issueId: importedIssue.paperclipIssueId,
-              currentDescription,
-              githubIssue,
-              linkedPullRequestNumbers: snapshotLinkedPullRequestNumbers,
-              paperclipApiBaseUrl
-            }
-          )
-        ) {
+        const snapshotDescriptionResult = await synchronizePaperclipIssueDescriptionWithDriftGuard(ctx, {
+          companyId: mapping.companyId,
+          importedIssue,
+          currentDescription,
+          githubIssue,
+          linkedPullRequestNumbers: snapshotLinkedPullRequestNumbers,
+          paperclipApiBaseUrl,
+          persistImportRegistry
+        });
+        descriptionDrifted = descriptionDrifted || snapshotDescriptionResult.drifted;
+        if (snapshotDescriptionResult.updated) {
           descriptionUpdated = true;
           currentDescription = buildPaperclipIssueDescription(githubIssue, snapshotLinkedPullRequestNumbers);
         }
@@ -15390,6 +15468,9 @@ async function synchronizePaperclipIssueStatuses(
 
       if (descriptionUpdated) {
         updatedDescriptionsCount += 1;
+      }
+      if (descriptionDrifted) {
+        driftedDescriptionsCount += 1;
       }
 
         if (!paperclipIssue || !snapshot) {
@@ -15835,7 +15916,8 @@ async function synchronizePaperclipIssueStatuses(
   return {
     updatedStatusesCount,
     updatedLabelsCount,
-    updatedDescriptionsCount
+    updatedDescriptionsCount,
+    driftedDescriptionsCount
   };
 }
 
@@ -21897,6 +21979,7 @@ async function performSync(
   let updatedStatusesCount = 0;
   let updatedLabelsCount = 0;
   let updatedDescriptionsCount = 0;
+  let driftedDescriptionsCount = 0;
   const recoverableFailures: SyncProcessingFailure[] = [];
   const nextRegistry = [...importRegistry];
   const companyLabelDirectoryCache = new Map<string, PaperclipLabelDirectory>();
@@ -22482,6 +22565,7 @@ async function performSync(
         updatedStatusesCount += synchronizationResult.updatedStatusesCount;
         updatedLabelsCount += synchronizationResult.updatedLabelsCount;
         updatedDescriptionsCount += synchronizationResult.updatedDescriptionsCount;
+        driftedDescriptionsCount += synchronizationResult.driftedDescriptionsCount ?? 0;
 
         const pullRequestSynchronizationResult = await synchronizePaperclipPullRequestIssueStatuses(
           ctx,
@@ -22660,6 +22744,7 @@ async function performSync(
         updatedStatusesCount += synchronizationResult.updatedStatusesCount;
         updatedLabelsCount += synchronizationResult.updatedLabelsCount;
         updatedDescriptionsCount += synchronizationResult.updatedDescriptionsCount;
+        driftedDescriptionsCount += synchronizationResult.driftedDescriptionsCount ?? 0;
       } catch (error) {
         if (error instanceof SyncCancellationError || isGitHubRateLimitError(error)) {
           throw error;
@@ -22778,7 +22863,7 @@ async function performSync(
 
     const nextSyncState = {
       status: 'success' as const,
-      message: `${options.target ? `GitHub sync for ${options.target.displayLabel} is complete. ` : 'Sync complete. '}Imported ${createdIssuesCount} issues, updated ${updatedStatusesCount} issue status${updatedStatusesCount === 1 ? '' : 'es'}, updated ${updatedLabelsCount} issue label set${updatedLabelsCount === 1 ? '' : 's'}, updated ${updatedDescriptionsCount} issue description${updatedDescriptionsCount === 1 ? '' : 's'}, and skipped ${skippedIssuesCount} already-synced issue${skippedIssuesCount === 1 ? '' : 's'}.`,
+      message: `${options.target ? `GitHub sync for ${options.target.displayLabel} is complete. ` : 'Sync complete. '}Imported ${createdIssuesCount} issues, updated ${updatedStatusesCount} issue status${updatedStatusesCount === 1 ? '' : 'es'}, updated ${updatedLabelsCount} issue label set${updatedLabelsCount === 1 ? '' : 's'}, updated ${updatedDescriptionsCount} issue description${updatedDescriptionsCount === 1 ? '' : 's'}${driftedDescriptionsCount > 0 ? `, left ${driftedDescriptionsCount} drifted issue description${driftedDescriptionsCount === 1 ? '' : 's'} untouched` : ''}, and skipped ${skippedIssuesCount} already-synced issue${skippedIssuesCount === 1 ? '' : 's'}.`,
       checkedAt: new Date().toISOString(),
       syncedIssuesCount,
       createdIssuesCount,
@@ -24950,6 +25035,31 @@ const plugin = definePlugin({
             requireUnlinked: true,
             followThroughAssigneeAgentId: record.followThroughAssigneeAgentId
           });
+    });
+
+    ctx.actions.register('issue.acceptGitHubDescription', async (input, actionContext) => {
+      const record = normalizeActionRecord(input, actionContext);
+      const companyId = normalizeCompanyId(record.companyId);
+      const issueId = normalizeOptionalString(record.issueId);
+      if (!companyId || !issueId) {
+        throw new Error('companyId and issueId are required.');
+      }
+
+      const registry = normalizeImportRegistry(await ctx.state.get(IMPORT_REGISTRY_SCOPE));
+      const entry = registry.find((candidate) => candidate.paperclipIssueId === issueId);
+      if (!entry) {
+        throw new Error('This Paperclip issue is not a synced GitHub issue.');
+      }
+      const paperclipIssue = await ctx.issues.get(issueId, companyId);
+      if (!paperclipIssue) {
+        throw new Error('Paperclip issue not found.');
+      }
+
+      // Adopt the current Paperclip text as the baseline. The next sync sees no edit and applies the GitHub text.
+      entry.descriptionHash = hashDescription(paperclipIssue.description);
+      delete entry.descriptionDriftKey;
+      await ctx.state.set(IMPORT_REGISTRY_SCOPE, registry);
+      return { accepted: true };
     });
 
     ctx.actions.register('issue.unlinkGitHubItem', async (input, actionContext) => {
