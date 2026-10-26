@@ -25244,7 +25244,8 @@ const plugin = definePlugin({
         repositoryUrl: parseRepositoryReference(mapping.repositoryUrl)?.url ?? mapping.repositoryUrl.trim(),
         paperclipProjectName: mapping.paperclipProjectName.trim(),
         paperclipProjectId: mapping.paperclipProjectId,
-        companyId: mapping.companyId
+        companyId: mapping.companyId,
+        ...(mapping.importMaxAgeDays !== undefined ? { importMaxAgeDays: mapping.importMaxAgeDays } : {})
       }));
       const materializedCurrent = materializeScopedSettings(current, config, requestedCompanyId);
       const next = sanitizeSettingsForCurrentSetup({
