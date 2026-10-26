@@ -9,6 +9,7 @@ import type { Agent, Project } from '@paperclipai/plugin-sdk';
 import { createTestHarness } from '@paperclipai/plugin-sdk/testing';
 
 import type { PublishLocalBranchInput, PublishedBranch } from '../src/git-branch-publisher.ts';
+import { resolveImportMaxAgeDays } from '../src/import-age-filter.ts';
 import manifest from '../src/manifest.ts';
 import {
   COMPANY_METRIC_API_ROUTE_KEY,
@@ -4308,6 +4309,59 @@ test('sync.runNow records backlog snapshots and closed-issue KPI activity for th
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('settings.saveRegistration round-trips a per-mapping importMaxAgeDays that overrides the company default', async () => {
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRef: 'github-secret-ref'
+    }
+  });
+  await plugin.definition.setup(harness.ctx);
+
+  const saved = await harness.performAction('settings.saveRegistration', {
+    companyId: 'company-1',
+    mappings: [
+      {
+        id: 'mapping-a',
+        repositoryUrl: 'paperclipai/example-repo',
+        paperclipProjectName: 'Engineering',
+        paperclipProjectId: 'project-1',
+        companyId: 'company-1',
+        importMaxAgeDays: 30
+      },
+      {
+        id: 'mapping-b',
+        repositoryUrl: 'paperclipai/other-repo',
+        paperclipProjectName: 'Ops',
+        paperclipProjectId: 'project-2',
+        companyId: 'company-1'
+      }
+    ],
+    advancedSettings: { importMaxAgeDays: 60 }
+  }) as {
+    mappings: Array<{ id: string; importMaxAgeDays?: number }>;
+    advancedSettings: { importMaxAgeDays?: number };
+  };
+
+  assert.equal(saved.mappings.find((mapping) => mapping.id === 'mapping-a')?.importMaxAgeDays, 30);
+  assert.equal(saved.mappings.find((mapping) => mapping.id === 'mapping-b')?.importMaxAgeDays, undefined);
+  assert.equal(saved.advancedSettings.importMaxAgeDays, 60);
+
+  const stored = harness.getState({
+    scopeKind: 'instance',
+    stateKey: 'paperclip-github-plugin-settings'
+  }) as { mappings: Array<{ id: string; importMaxAgeDays?: number }> };
+  assert.equal(stored.mappings.find((mapping) => mapping.id === 'mapping-a')?.importMaxAgeDays, 30);
+
+  const readBack = await harness.getData('settings.registration', { companyId: 'company-1' }) as {
+    mappings: Array<{ id: string; importMaxAgeDays?: number }>;
+  };
+  assert.equal(readBack.mappings.find((mapping) => mapping.id === 'mapping-a')?.importMaxAgeDays, 30);
+
+  assert.equal(resolveImportMaxAgeDays(stored.mappings[0]?.importMaxAgeDays, saved.advancedSettings.importMaxAgeDays), 30);
+  assert.equal(resolveImportMaxAgeDays(stored.mappings[1]?.importMaxAgeDays, saved.advancedSettings.importMaxAgeDays), 60);
 });
 
 test('sync.runNow with importMaxAgeDays skips stale new issues, keeps syncing imported ones, and reports counts', async () => {
