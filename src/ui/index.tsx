@@ -14766,12 +14766,14 @@ function GitHubSyncIssueDetailTabContent(props: {
   });
   const linkGitHubItem = usePluginAction('issue.linkGitHubItem');
   const unlinkGitHubItem = usePluginAction('issue.unlinkGitHubItem');
+  const acceptGitHubDescription = usePluginAction('issue.acceptGitHubDescription');
   const toast = usePluginToast();
   const [manualLinkOpen, setManualLinkOpen] = useState(false);
   const [manualLinkKind, setManualLinkKind] = useState<ManualGitHubLinkKind>('issue');
   const [manualLinkReference, setManualLinkReference] = useState('');
   const [manualLinkPending, setManualLinkPending] = useState(false);
   const [unlinkPending, setUnlinkPending] = useState(false);
+  const [acceptDescriptionPending, setAcceptDescriptionPending] = useState(false);
 
   useEffect(() => {
     if (!props.companyId || !props.issueId) {
@@ -14843,6 +14845,40 @@ function GitHubSyncIssueDetailTabContent(props: {
       });
     } finally {
       setManualLinkPending(false);
+    }
+  }
+
+  async function handleAcceptGitHubDescription(): Promise<void> {
+    if (!props.companyId || !props.issueId || acceptDescriptionPending) {
+      return;
+    }
+
+    if (
+      typeof window !== 'undefined' &&
+      !window.confirm('Accept the GitHub description? The next sync replaces this issue\'s Paperclip description with the GitHub text. Move any text you want to keep into a comment first.')
+    ) {
+      return;
+    }
+
+    setAcceptDescriptionPending(true);
+    try {
+      await acceptGitHubDescription({
+        companyId: props.companyId,
+        issueId: props.issueId
+      });
+      toast({
+        title: 'GitHub description accepted',
+        body: 'The next sync will apply the GitHub description to this issue.',
+        tone: 'success'
+      });
+    } catch (error) {
+      toast({
+        title: 'Unable to accept GitHub description',
+        body: getActionErrorMessage(error, 'GitHub Sync could not update this issue.'),
+        tone: 'error'
+      });
+    } finally {
+      setAcceptDescriptionPending(false);
     }
   }
 
@@ -15005,6 +15041,21 @@ function GitHubSyncIssueDetailTabContent(props: {
                 >
                   <GitHubButtonLabel label="Open on GitHub" />
                 </a>
+              ) : null}
+              {issueDetailsKind === 'issue' ? (
+                <button
+                  type="button"
+                  className={getPluginActionClassName({
+                    variant: 'secondary',
+                    size: 'sm',
+                    extraClassName: 'ghsync-extension-link'
+                  })}
+                  disabled={acceptDescriptionPending}
+                  onClick={() => { void handleAcceptGitHubDescription(); }}
+                  title="Resume description sync after a drift comment by taking the GitHub text"
+                >
+                  <LoadingButtonContent busy={acceptDescriptionPending} label="Accept GitHub description" busyLabel="Accepting" />
+                </button>
               ) : null}
               <button
                 type="button"
