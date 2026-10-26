@@ -4310,6 +4310,143 @@ test('sync.runNow records backlog snapshots and closed-issue KPI activity for th
   }
 });
 
+test('sync.runNow with importMaxAgeDays skips stale new issues, keeps syncing imported ones, and reports counts', async () => {
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRef: 'github-secret-ref'
+    }
+  });
+  await plugin.definition.setup(harness.ctx);
+
+  const rejected = await harness.performAction('settings.saveRegistration', {
+    companyId: 'company-1',
+    advancedSettings: { importMaxAgeDays: 0 }
+  }).then(() => null, (error: unknown) => error);
+  assert.match(String((rejected as Error | null)?.message), /importMaxAgeDays must be a whole number/);
+
+  await harness.performAction('settings.saveRegistration', {
+    companyId: 'company-1',
+    mappings: [
+      {
+        id: 'mapping-a',
+        repositoryUrl: 'paperclipai/example-repo',
+        paperclipProjectName: 'Engineering',
+        paperclipProjectId: 'project-1',
+        companyId: 'company-1'
+      }
+    ],
+    advancedSettings: { importMaxAgeDays: 60 }
+  });
+
+  const alreadyImportedOldIssue = await harness.ctx.issues.create({
+    companyId: 'company-1',
+    projectId: 'project-1',
+    title: 'Old but already imported'
+  });
+  await harness.ctx.state.set(
+    { scopeKind: 'instance', stateKey: 'paperclip-github-plugin-import-registry' },
+    [
+      {
+        mappingId: 'mapping-a',
+        githubIssueId: 6102,
+        githubIssueNumber: 62,
+        paperclipIssueId: alreadyImportedOldIssue.id,
+        importedAt: '2026-01-09T09:00:00.000Z',
+        lastSeenCommentCount: 0,
+        lastSeenGitHubState: 'open'
+      }
+    ]
+  );
+
+  const daysAgo = (days: number) => new Date(Date.now() - days * 86_400_000).toISOString();
+  const githubIssues = [
+    { id: 6100, number: 60, title: 'Recent issue', updated_at: daysAgo(3) },
+    { id: 6101, number: 61, title: 'Stale never-imported issue', updated_at: daysAgo(200) },
+    { id: 6102, number: 62, title: 'Old but already imported', updated_at: daysAgo(200) }
+  ].map((issue) => ({
+    ...issue,
+    body: 'body',
+    html_url: `https://github.com/paperclipai/example-repo/issues/${issue.number}`,
+    state: 'open',
+    comments: 0
+  }));
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+
+    if (url.pathname === '/repos/paperclipai/example-repo/issues') {
+      return jsonResponse(githubIssues);
+    }
+
+    if (url.pathname === '/graphql') {
+      const { query, variables } = getGraphqlRequest(init);
+      const issueNumber = typeof variables.issueNumber === 'number' ? variables.issueNumber : undefined;
+
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse(githubIssues.map((issue) => ({ issueNumber: issue.number })));
+      }
+
+      if (query.includes('query GitHubRepositoryOpenIssueLinkedPullRequests')) {
+        return graphqlResponse({
+          repository: {
+            issues: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: []
+            }
+          }
+        });
+      }
+
+      if (query.includes('query GitHubIssueStatusSnapshot')) {
+        return graphqlResponse({
+          repository: {
+            issue: {
+              number: issueNumber,
+              state: 'OPEN',
+              stateReason: null,
+              comments: { totalCount: 0 },
+              closedByPullRequestsReferences: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: []
+              }
+            }
+          }
+        });
+      }
+    }
+
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  try {
+    const sync = await harness.performAction('sync.runNow', {
+      companyId: 'company-1',
+      waitForCompletion: true
+    }) as { syncState: { status: string; message?: string; createdIssuesCount?: number; syncedIssuesCount?: number } };
+
+    assert.equal(sync.syncState.status, 'success');
+    assert.equal(sync.syncState.createdIssuesCount, 1);
+    assert.equal(sync.syncState.syncedIssuesCount, 2);
+    assert.match(sync.syncState.message ?? '', /skipped 1 older than 60 days/);
+
+    const titles = (await harness.ctx.issues.list({ companyId: 'company-1', projectId: 'project-1' }))
+      .map((issue) => issue.title);
+    assert.ok(titles.some((title) => title.includes('Recent issue')));
+    assert.ok(!titles.some((title) => title.includes('Stale never-imported issue')));
+
+    const importRegistry = harness.getState({
+      scopeKind: 'instance',
+      stateKey: 'paperclip-github-plugin-import-registry'
+    }) as Array<{ githubIssueId?: number }>;
+    assert.ok(importRegistry.some((entry) => entry.githubIssueId === 6102));
+    assert.ok(!importRegistry.some((entry) => entry.githubIssueId === 6101));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('update_issue declares every GitHub-native state reason', () => {
   const declaration = manifest.tools?.find((tool) => tool.name === 'update_issue');
   const properties = declaration?.parametersSchema?.properties as Record<string, { enum?: unknown[]; minimum?: number }> | undefined;

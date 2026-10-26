@@ -1,6 +1,13 @@
 import { Buffer } from 'node:buffer';
 import { createHash, randomUUID } from 'node:crypto';
 import { buildDescriptionDriftComment, decideDescriptionDrift, hashDescription } from './description-drift.ts';
+import {
+  formatSkippedByAgeSummary,
+  normalizeImportMaxAgeDays,
+  partitionIssuesByImportAge,
+  resolveImportMaxAgeDays,
+  validateImportMaxAgeDays
+} from './import-age-filter.ts';
 import { realpathSync } from 'node:fs';
 import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -270,6 +277,8 @@ interface RepositoryMapping {
   paperclipProjectName: string;
   paperclipProjectId?: string;
   companyId?: string;
+  /** Per-mapping override of the company importMaxAgeDays default. */
+  importMaxAgeDays?: number;
 }
 
 interface GitHubSyncAdvancedSettings {
@@ -283,6 +292,8 @@ interface GitHubSyncAdvancedSettings {
   approverAssigneeUserId?: string;
   defaultStatus: PaperclipIssueStatus;
   ignoredIssueAuthorUsernames: string[];
+  /** Import only open issues updated within this many days. Unset imports everything. */
+  importMaxAgeDays?: number;
 }
 
 interface GitHubSyncAssigneeOption {
@@ -817,6 +828,7 @@ interface GitHubIssueRecord {
   state: 'open' | 'closed';
   stateReason?: GitHubIssueStateReason;
   commentsCount: number;
+  updatedAt?: string;
 }
 
 interface RepositorySyncPlan {
@@ -829,6 +841,8 @@ interface RepositorySyncPlan {
   allIssuesById: Map<number, GitHubIssueRecord>;
   pullRequestLinks: GitHubPullRequestLinkRecord[];
   trackedIssueCount: number;
+  skippedByAgeCount: number;
+  importMaxAgeDays?: number;
 }
 
 interface ExternalGitHubLinkSyncWork {
@@ -880,6 +894,7 @@ interface GitHubApiIssueRecord {
   } | null;
   state: string;
   comments?: number;
+  updated_at?: string | null;
   state_reason?: string | null;
   author_association?: string | null;
   labels?: GitHubApiIssueLabelRecord[];
@@ -5983,13 +5998,15 @@ function normalizeMappings(value: unknown): RepositoryMapping[] {
     const paperclipProjectId = typeof record.paperclipProjectId === 'string' ? record.paperclipProjectId : undefined;
     const companyId = normalizeCompanyId(record.companyId);
     const parsedRepository = parseRepositoryReference(repositoryInput);
+    const importMaxAgeDays = normalizeImportMaxAgeDays(record.importMaxAgeDays);
 
     return {
       id,
       repositoryUrl: parsedRepository?.url ?? repositoryInput.trim(),
       paperclipProjectName,
       paperclipProjectId,
-      companyId
+      companyId,
+      ...(importMaxAgeDays !== undefined ? { importMaxAgeDays } : {})
     };
   });
 }
@@ -6093,6 +6110,7 @@ function normalizeAdvancedSettings(value: unknown): GitHubSyncAdvancedSettings {
     'ignoredIssueAuthorUsernames' in record
       ? normalizeIgnoredIssueAuthorUsernames(record.ignoredIssueAuthorUsernames)
       : DEFAULT_ADVANCED_SETTINGS.ignoredIssueAuthorUsernames;
+  const importMaxAgeDays = normalizeImportMaxAgeDays(record.importMaxAgeDays);
   return {
     ...normalizeAdvancedSettingsAssigneeOverride(record, {
       agentId: 'defaultAssigneeAgentId',
@@ -6111,7 +6129,8 @@ function normalizeAdvancedSettings(value: unknown): GitHubSyncAdvancedSettings {
       userId: 'approverAssigneeUserId'
     }),
     defaultStatus,
-    ignoredIssueAuthorUsernames
+    ignoredIssueAuthorUsernames,
+    ...(importMaxAgeDays !== undefined ? { importMaxAgeDays } : {})
   };
 }
 
@@ -7433,7 +7452,8 @@ function normalizeGitHubIssueRecord(issue: GitHubApiIssueRecord): GitHubIssueRec
     labels: normalizeGitHubIssueLabels(issue.labels),
     state: issue.state === 'closed' ? 'closed' : 'open',
     stateReason: normalizeGitHubIssueStateReason(issue.state_reason),
-    commentsCount: typeof issue.comments === 'number' && issue.comments >= 0 ? Math.floor(issue.comments) : 0
+    commentsCount: typeof issue.comments === 'number' && issue.comments >= 0 ? Math.floor(issue.comments) : 0,
+    ...(typeof issue.updated_at === 'string' && issue.updated_at ? { updatedAt: issue.updated_at } : {})
   };
 }
 
@@ -22146,6 +22166,7 @@ async function performSync(
   }
 
   const repositoryPlans: RepositorySyncPlan[] = [];
+  const skippedByAgeEntries: Array<{ repositoryUrl: string; skippedCount: number; maxAgeDays: number }> = [];
 
   try {
     await throwIfSyncCancelled();
@@ -22214,9 +22235,37 @@ async function performSync(
         });
         const advancedSettings = getCompanyAdvancedSettings(settings, mapping.companyId);
         const eligibleIssues = allIssues.filter((issue) => !shouldIgnoreGitHubIssue(issue, advancedSettings));
-        const issues = (await listRepositoryIssuesForImport(eligibleIssues)).filter((issue) =>
+        const importCandidates = (await listRepositoryIssuesForImport(eligibleIssues)).filter((issue) =>
           doesGitHubIssueMatchTarget(issue, options.target)
         );
+        const importMaxAgeDays = resolveImportMaxAgeDays(mapping.importMaxAgeDays, advancedSettings.importMaxAgeDays);
+        const exemptIssueIds = new Set<number>(importedIssueRecords.map((entry) => entry.githubIssueId));
+        const exemptIssueUrls = new Set<string>();
+        if (importMaxAgeDays !== undefined) {
+          for (const record of await listGitHubIssueLinkRecords(ctx)) {
+            if (doesGitHubIssueLinkRecordMatchMapping(record, mapping)) {
+              exemptIssueUrls.add(record.data.githubIssueUrl);
+            }
+          }
+        }
+        const { eligible: issues, skippedByAge } = partitionIssuesByImportAge({
+          issues: importCandidates,
+          maxAgeDays: options.target?.kind === 'issue' ? undefined : importMaxAgeDays,
+          now: new Date(),
+          isExempt: (issue) => exemptIssueIds.has(issue.id) || exemptIssueUrls.has(issue.htmlUrl)
+        });
+        if (skippedByAge.length > 0 && importMaxAgeDays !== undefined) {
+          skippedByAgeEntries.push({
+            repositoryUrl: repository.url,
+            skippedCount: skippedByAge.length,
+            maxAgeDays: importMaxAgeDays
+          });
+          ctx.logger.info('GitHub sync skipped open issues older than the import age limit.', {
+            repositoryUrl: repository.url,
+            skippedCount: skippedByAge.length,
+            importMaxAgeDays
+          });
+        }
         const allIssuesById = new Map(eligibleIssues.map((issue) => [issue.id, issue] as const));
         const importRegistryByIssueId = new Map(
           importedIssueRecords.map((entry) => [entry.githubIssueId, entry])
@@ -22257,7 +22306,9 @@ async function performSync(
           issues,
           allIssuesById,
           pullRequestLinks,
-          trackedIssueCount
+          trackedIssueCount,
+          skippedByAgeCount: skippedByAge.length,
+          ...(importMaxAgeDays !== undefined ? { importMaxAgeDays } : {})
         });
       } catch (error) {
         if (error instanceof SyncCancellationError || isGitHubRateLimitError(error)) {
@@ -22861,9 +22912,10 @@ async function performSync(
       return materializeScopedSettings(next, config, targetCompanyId);
     }
 
+    const skippedByAgeSummary = formatSkippedByAgeSummary(skippedByAgeEntries);
     const nextSyncState = {
       status: 'success' as const,
-      message: `${options.target ? `GitHub sync for ${options.target.displayLabel} is complete. ` : 'Sync complete. '}Imported ${createdIssuesCount} issues, updated ${updatedStatusesCount} issue status${updatedStatusesCount === 1 ? '' : 'es'}, updated ${updatedLabelsCount} issue label set${updatedLabelsCount === 1 ? '' : 's'}, updated ${updatedDescriptionsCount} issue description${updatedDescriptionsCount === 1 ? '' : 's'}${driftedDescriptionsCount > 0 ? `, left ${driftedDescriptionsCount} drifted issue description${driftedDescriptionsCount === 1 ? '' : 's'} untouched` : ''}, and skipped ${skippedIssuesCount} already-synced issue${skippedIssuesCount === 1 ? '' : 's'}.`,
+      message: `${options.target ? `GitHub sync for ${options.target.displayLabel} is complete. ` : 'Sync complete. '}Imported ${createdIssuesCount} issues, updated ${updatedStatusesCount} issue status${updatedStatusesCount === 1 ? '' : 'es'}, updated ${updatedLabelsCount} issue label set${updatedLabelsCount === 1 ? '' : 's'}, updated ${updatedDescriptionsCount} issue description${updatedDescriptionsCount === 1 ? '' : 's'}${driftedDescriptionsCount > 0 ? `, left ${driftedDescriptionsCount} drifted issue description${driftedDescriptionsCount === 1 ? '' : 's'} untouched` : ''}, and skipped ${skippedIssuesCount} already-synced issue${skippedIssuesCount === 1 ? '' : 's'}.${skippedByAgeSummary ? ` Age filter: ${skippedByAgeSummary}.` : ''}`,
       checkedAt: new Date().toISOString(),
       syncedIssuesCount,
       createdIssuesCount,
@@ -25120,6 +25172,21 @@ const plugin = definePlugin({
         !requestedCompanyId && 'githubTokenLogin' in record
           ? requestedGitHubTokenLogin
           : previous.githubTokenLogin;
+      if (hasMappingsPatch && Array.isArray(record.mappings)) {
+        for (const mappingInput of record.mappings) {
+          const mappingRecord = mappingInput && typeof mappingInput === 'object' ? mappingInput as Record<string, unknown> : {};
+          const validation = validateImportMaxAgeDays(mappingRecord.importMaxAgeDays);
+          if (!validation.valid) {
+            throw new Error(validation.error);
+          }
+        }
+      }
+      if (hasAdvancedSettingsPatch && record.advancedSettings && typeof record.advancedSettings === 'object') {
+        const validation = validateImportMaxAgeDays((record.advancedSettings as Record<string, unknown>).importMaxAgeDays);
+        if (!validation.valid) {
+          throw new Error(validation.error);
+        }
+      }
       const inputMappings = hasMappingsPatch ? normalizeMappings(record.mappings) : previous.mappings;
       const nextCompanyAdvancedSettingsByCompanyId = {
         ...(previous.companyAdvancedSettingsByCompanyId ?? {})

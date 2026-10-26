@@ -14,6 +14,12 @@ import remarkGfm from 'remark-gfm';
 
 import { GITHUB_SYNC_PLUGIN_ID } from '../kpi-contract.ts';
 import { parseRepositoryReference, type ParsedRepositoryReference } from '../github-repo.ts';
+import {
+  IMPORT_MAX_AGE_DAYS_MAX,
+  IMPORT_MAX_AGE_DAYS_MIN,
+  normalizeImportMaxAgeDays,
+  validateImportMaxAgeDays
+} from '../import-age-filter.ts';
 import { resolvePaperclipAuthControlsPolicy } from '../paperclip-health.ts';
 import { normalizeCompanyAssigneeOptionsResponse, type GitHubSyncAssigneeOption } from './assignees.ts';
 import { buildPaperclipUrl, fetchJson, fetchPaperclipHealth, resolveCliAuthPollUrl } from './http.ts';
@@ -201,6 +207,7 @@ interface RepositoryMapping {
   paperclipProjectName: string;
   paperclipProjectId?: string;
   companyId?: string;
+  importMaxAgeDays?: number;
 }
 
 interface SyncRunState {
@@ -272,6 +279,7 @@ interface GitHubSyncAdvancedSettings {
   approverAssigneeUserId?: string;
   defaultStatus: PaperclipIssueStatus;
   ignoredIssueAuthorUsernames: string[];
+  importMaxAgeDays?: number;
 }
 
 /**
@@ -4991,7 +4999,10 @@ function normalizeAdvancedSettings(value: unknown): GitHubSyncAdvancedSettings {
     ignoredIssueAuthorUsernames:
       'ignoredIssueAuthorUsernames' in record
         ? normalizeIgnoredIssueAuthorUsernames(record.ignoredIssueAuthorUsernames)
-        : DEFAULT_ADVANCED_SETTINGS.ignoredIssueAuthorUsernames
+        : DEFAULT_ADVANCED_SETTINGS.ignoredIssueAuthorUsernames,
+    ...(normalizeImportMaxAgeDays(record.importMaxAgeDays) !== undefined
+      ? { importMaxAgeDays: normalizeImportMaxAgeDays(record.importMaxAgeDays) }
+      : {})
   };
 }
 
@@ -5002,7 +5013,8 @@ function getComparableMappings(mappings: RepositoryMapping[]): RepositoryMapping
       repositoryUrl: mapping.repositoryUrl.trim(),
       paperclipProjectName: mapping.paperclipProjectName.trim(),
       paperclipProjectId: mapping.paperclipProjectId,
-      companyId: mapping.companyId
+      companyId: mapping.companyId,
+      ...(mapping.importMaxAgeDays !== undefined ? { importMaxAgeDays: mapping.importMaxAgeDays } : {})
     }))
     .filter((mapping) => mapping.repositoryUrl !== '' || mapping.paperclipProjectName !== '');
 }
@@ -5020,7 +5032,8 @@ function getComparableAdvancedSettings(value: GitHubSyncAdvancedSettings | null 
     ...(settings.approverAssigneeAgentId ? { approverAssigneeAgentId: settings.approverAssigneeAgentId } : {}),
     ...(settings.approverAssigneeUserId ? { approverAssigneeUserId: settings.approverAssigneeUserId } : {}),
     defaultStatus: settings.defaultStatus,
-    ignoredIssueAuthorUsernames: [...settings.ignoredIssueAuthorUsernames].sort((left, right) => left.localeCompare(right))
+    ignoredIssueAuthorUsernames: [...settings.ignoredIssueAuthorUsernames].sort((left, right) => left.localeCompare(right)),
+    ...(settings.importMaxAgeDays !== undefined ? { importMaxAgeDays: settings.importMaxAgeDays } : {})
   };
 }
 
@@ -5193,7 +5206,9 @@ function formatAdvancedSettingsSummary(
       ? advancedSettings.ignoredIssueAuthorUsernames.join(', ')
       : 'none';
   const handoffLabel = `Back to work: ${executorLabel} · Review: ${reviewerLabel} · Approval: ${approverLabel}`;
-  return `Import: ${assigneeLabel} · ${handoffLabel} · Status: ${statusLabel} · Ignore: ${ignoredAuthorsLabel}`;
+  const importAgeLabel =
+    advancedSettings.importMaxAgeDays !== undefined ? `last ${advancedSettings.importMaxAgeDays} days` : 'all open issues';
+  return `Import: ${assigneeLabel} · ${handoffLabel} · Status: ${statusLabel} · Ignore: ${ignoredAuthorsLabel} · Age: ${importAgeLabel}`;
 }
 
 export function resolveSavedTokenUiState(params: {
@@ -11967,7 +11982,21 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
     );
   }
 
-  function updateMapping(mappingId: string, field: keyof RepositoryMapping, value: string) {
+  function updateMappingImportMaxAgeDays(mappingId: string, rawValue: string) {
+    const parsed = rawValue.trim() === '' ? undefined : Number(rawValue);
+    setForm((current) => ({
+      ...current,
+      mappings: current.mappings.map((mapping) => {
+        if (mapping.id !== mappingId) {
+          return mapping;
+        }
+        const { importMaxAgeDays: _previous, ...rest } = mapping;
+        return parsed === undefined ? rest : { ...rest, importMaxAgeDays: parsed };
+      })
+    }));
+  }
+
+  function updateMapping(mappingId: string, field: Exclude<keyof RepositoryMapping, 'importMaxAgeDays'>, value: string) {
     setForm((current) => {
       const hasMapping = current.mappings.some((mapping) => mapping.id === mappingId);
       const nextMappings = hasMapping
@@ -12307,8 +12336,18 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
         throw new Error(paperclipApiBaseUrlError);
       }
 
+      const advancedAgeValidation = validateImportMaxAgeDays(draftAdvancedSettings.importMaxAgeDays);
+      if (!advancedAgeValidation.valid) {
+        throw new Error(advancedAgeValidation.error);
+      }
+
       const resolvedMappings: RepositoryMapping[] = [];
       for (const mapping of form.mappings) {
+        const mappingAgeValidation = validateImportMaxAgeDays(mapping.importMaxAgeDays);
+        if (!mappingAgeValidation.valid) {
+          throw new Error(mappingAgeValidation.error);
+        }
+
         const repositoryInput = mapping.repositoryUrl.trim();
         const paperclipProjectName = mapping.paperclipProjectName.trim();
 
@@ -12941,6 +12980,23 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
                               readOnly={Boolean(mapping.paperclipProjectId)}
                             />
                           </div>
+
+                          <div className="ghsync__field">
+                            <label htmlFor={`import-max-age-${mapping.id}`}>Only import issues active in the last (days)</label>
+                            <input
+                              id={`import-max-age-${mapping.id}`}
+                              className="ghsync__input"
+                              type="number"
+                              min={IMPORT_MAX_AGE_DAYS_MIN}
+                              max={IMPORT_MAX_AGE_DAYS_MAX}
+                              step={1}
+                              value={mapping.importMaxAgeDays ?? ''}
+                              disabled={settingsMutationsLocked}
+                              onChange={(event) => updateMappingImportMaxAgeDays(mapping.id, event.currentTarget.value)}
+                              placeholder="Use company default"
+                            />
+                            <p className="ghsync__hint">Overrides the company default for this repository. Leave empty to use it.</p>
+                          </div>
                         </div>
                       </section>
                     );
@@ -13143,6 +13199,38 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
                     placeholder="renovate"
                   />
                   <p className="ghsync__hint">Comma or newline separated.</p>
+                </div>
+
+                <div className="ghsync__field">
+                  <label htmlFor="advanced-import-max-age-days">Only import issues active in the last (days)</label>
+                  <input
+                    id="advanced-import-max-age-days"
+                    className="ghsync__input"
+                    type="number"
+                    min={IMPORT_MAX_AGE_DAYS_MIN}
+                    max={IMPORT_MAX_AGE_DAYS_MAX}
+                    step={1}
+                    value={form.advancedSettings.importMaxAgeDays ?? ''}
+                    disabled={settingsMutationsLocked}
+                    onChange={(event) => {
+                      const rawValue = event.currentTarget.value.trim();
+                      const importMaxAgeDays = rawValue === '' ? undefined : Number(rawValue);
+                      setForm((current) => {
+                        const { importMaxAgeDays: _previous, ...rest } = current.advancedSettings;
+                        return {
+                          ...current,
+                          advancedSettings: importMaxAgeDays === undefined ? rest : { ...rest, importMaxAgeDays }
+                        };
+                      });
+                    }}
+                    placeholder="All open issues"
+                  />
+                  <p className="ghsync__hint">
+                    Company default, from {IMPORT_MAX_AGE_DAYS_MIN} to {IMPORT_MAX_AGE_DAYS_MAX} days. A new open issue is imported only if
+                    it was updated on GitHub within this window, so a stale issue that gets a comment is picked up on the next sync.
+                    Issues already imported or linked keep syncing at any age. Leave empty to import every open issue. The sync summary
+                    reports how many issues were skipped. Nothing is changed on GitHub.
+                  </p>
                 </div>
 
               </div>
