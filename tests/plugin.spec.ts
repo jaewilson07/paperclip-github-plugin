@@ -19928,6 +19928,8 @@ test('worker resyncs imported issue descriptions when the GitHub body changes la
         companyId: 'company-1'
       }
     ],
+    companyId: 'company-1',
+    advancedSettings: { defaultAssigneeAgentId: 'agent-default' },
     syncState: {
       status: 'idle'
     }
@@ -20112,6 +20114,8 @@ test('worker reports description drift instead of overwriting an edited Papercli
         companyId: 'company-1'
       }
     ],
+    companyId: 'company-1',
+    advancedSettings: { defaultAssigneeAgentId: 'agent-default' },
     syncState: {
       status: 'idle'
     }
@@ -20297,6 +20301,183 @@ test('worker reports description drift instead of overwriting an edited Papercli
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+async function runUnassignedInProgressScenario(options: {
+  advancedSettings?: Record<string, unknown>;
+  assignIssueAfterImport?: { assigneeAgentId: string };
+}) {
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRef: 'github-secret-ref'
+    }
+  });
+  await plugin.definition.setup(harness.ctx);
+
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      {
+        id: 'mapping-a',
+        repositoryUrl: 'paperclipai/example-repo',
+        paperclipProjectName: 'Engineering',
+        paperclipProjectId: 'project-1',
+        companyId: 'company-1'
+      }
+    ],
+    companyId: 'company-1',
+    ...(options.advancedSettings ? { advancedSettings: options.advancedSettings } : {}),
+    syncState: {
+      status: 'idle'
+    }
+  });
+
+  // Mirror the Paperclip host rule that rejects in_progress for unassigned issues.
+  const originalUpdate = harness.ctx.issues.update.bind(harness.ctx.issues);
+  const updateAttempts: Array<Record<string, unknown>> = [];
+  harness.ctx.issues.update = async (issueId, patch, companyId) => {
+    updateAttempts.push({ ...patch });
+    if (patch.status === 'in_progress') {
+      const existing = await harness.ctx.issues.get(issueId, companyId);
+      const hasAssignee = Boolean(patch.assigneeAgentId ?? patch.assigneeUserId ?? existing?.assigneeAgentId ?? existing?.assigneeUserId);
+      if (!hasAssignee) {
+        throw new Error('in_progress issues require an assignee');
+      }
+    }
+    return originalUpdate(issueId, patch, companyId);
+  };
+
+  let syncRun = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+
+    if (url.pathname === '/repos/paperclipai/example-repo/issues' && ['all', 'open'].includes(url.searchParams.get('state') ?? '')) {
+      return jsonResponse([
+        {
+          id: 2701,
+          number: 27,
+          title: 'Unassigned in progress',
+          body: 'Body',
+          html_url: 'https://github.com/paperclipai/example-repo/issues/27',
+          state: 'open'
+        }
+      ]);
+    }
+
+    if (url.pathname === '/graphql') {
+      const { query, variables } = getGraphqlRequest(init);
+      const issueNumber = typeof variables.issueNumber === 'number' ? variables.issueNumber : undefined;
+
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([{ issueNumber: 27 }]);
+      }
+
+      if (query.includes('query GitHubIssueStatusSnapshot') && issueNumber === 27) {
+        return graphqlResponse({
+          repository: {
+            issue: {
+              number: 27,
+              state: 'OPEN',
+              stateReason: null,
+              comments: { totalCount: 0 },
+              closedByPullRequestsReferences: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: syncRun === 0 ? [] : [{ number: 270, state: 'OPEN' }]
+              }
+            }
+          }
+        });
+      }
+
+      if (query.includes('query GitHubPullRequestReviewThreads')) {
+        return graphqlResponse({
+          repository: {
+            pullRequest: {
+              reviewThreads: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [{ isResolved: true }]
+              }
+            }
+          }
+        });
+      }
+
+      if (query.includes('query GitHubPullRequestCiContexts')) {
+        return graphqlResponse({
+          repository: {
+            pullRequest: {
+              statusCheckRollup: {
+                contexts: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  nodes: [{ __typename: 'StatusContext', state: 'PENDING' }]
+                }
+              }
+            }
+          }
+        });
+      }
+    }
+
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  try {
+    const firstSync = await harness.performAction('sync.runNow', {}) as {
+      syncState: { status: string; message?: string };
+    };
+    assert.equal(firstSync.syncState.status, 'success');
+
+    const findIssue = async () => (await harness.ctx.issues.list({ companyId: 'company-1' }))
+      .find((issue) => issue.title === 'Unassigned in progress');
+    const importedIssue = await findIssue();
+    assert.ok(importedIssue);
+    // Backlog is manual-only after import, so start from todo like an issue a human triaged.
+    await originalUpdate(importedIssue.id, { status: 'todo', ...options.assignIssueAfterImport }, 'company-1');
+    const statusBefore = 'todo';
+    updateAttempts.length = 0;
+    syncRun = 1;
+
+    const secondSync = await harness.performAction('sync.runNow', {}) as {
+      syncState: { status: string; message?: string; erroredIssuesCount?: number };
+    };
+    const issueAfter = await findIssue();
+    return { secondSync, issueAfter, statusBefore, updateAttempts, harness };
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+test('sync keeps the current status and reports a skip when in_progress needs an assignee', async () => {
+  const { secondSync, issueAfter, statusBefore, updateAttempts } = await runUnassignedInProgressScenario({});
+
+  assert.equal(secondSync.syncState.status, 'success');
+  assert.equal(secondSync.syncState.erroredIssuesCount ?? 0, 0);
+  assert.match(secondSync.syncState.message ?? '', /kept 1 issue status unchanged/);
+  assert.match(secondSync.syncState.message ?? '', /example-repo#27 kept todo: in_progress needs an assignee/);
+  assert.equal(issueAfter?.status, statusBefore);
+  assert.equal(updateAttempts.some((patch) => patch.status === 'in_progress'), false);
+});
+
+test('sync still moves an assigned issue to in_progress', async () => {
+  const { secondSync, issueAfter } = await runUnassignedInProgressScenario({
+    assignIssueAfterImport: { assigneeAgentId: 'agent-1' }
+  });
+
+  assert.equal(secondSync.syncState.status, 'success');
+  assert.doesNotMatch(secondSync.syncState.message ?? '', /unchanged/);
+  assert.equal(issueAfter?.status, 'in_progress');
+});
+
+test('sync still applies a configured default assignee when moving to in_progress', async () => {
+  const { secondSync, issueAfter } = await runUnassignedInProgressScenario({
+    advancedSettings: { defaultAssigneeAgentId: 'agent-default', executorAssigneeAgentId: 'agent-default' }
+  });
+
+  assert.equal(secondSync.syncState.status, 'success');
+  assert.doesNotMatch(secondSync.syncState.message ?? '', /unchanged/);
+  assert.equal(issueAfter?.status, 'in_progress');
+  assert.equal(issueAfter?.assigneeAgentId, 'agent-default');
 });
 
 test('get_issue resolves imported Paperclip issues from the hidden description marker when registry and entities are missing', async () => {
