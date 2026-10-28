@@ -15125,6 +15125,30 @@ async function moveImportedIssueToTransferredGitHubMapping(
   };
 }
 
+interface KeptStatusSkip {
+  repositoryUrl: string;
+  githubIssueNumber: number;
+  keptStatus: PaperclipIssueStatus;
+  reason: string;
+}
+
+function buildInProgressNeedsAssigneeSkip(params: {
+  repositoryUrl: string;
+  githubIssueNumber: number;
+  keptStatus: PaperclipIssueStatus;
+}): KeptStatusSkip {
+  return {
+    ...params,
+    reason: `kept ${formatPaperclipIssueStatus(params.keptStatus)}: in_progress needs an assignee`
+  };
+}
+
+function formatKeptStatusSkipSummary(skips: KeptStatusSkip[]): string {
+  const shown = skips.slice(0, 5).map((skip) => `${skip.repositoryUrl.replace(/^https:\/\/github\.com\//, '')}#${skip.githubIssueNumber} ${skip.reason}`);
+  const extra = skips.length - shown.length;
+  return `${shown.join('; ')}${extra > 0 ? `; and ${extra} more` : ''}`;
+}
+
 function buildUnmappedTransferredIssueCancellationComment(params: {
   previousStatus: PaperclipIssueStatus;
   nextStatus: PaperclipIssueStatus;
@@ -15355,6 +15379,7 @@ async function synchronizePaperclipIssueStatuses(
   updatedLabelsCount: number;
   updatedDescriptionsCount: number;
   driftedDescriptionsCount: number;
+  keptStatusSkips?: KeptStatusSkip[];
 }> {
   if (
     !mapping.companyId ||
@@ -15366,10 +15391,12 @@ async function synchronizePaperclipIssueStatuses(
       updatedStatusesCount: 0,
       updatedLabelsCount: 0,
       updatedDescriptionsCount: 0,
-      driftedDescriptionsCount: 0
+      driftedDescriptionsCount: 0,
+      keptStatusSkips: []
     };
   }
 
+  const keptStatusSkips: KeptStatusSkip[] = [];
   let updatedStatusesCount = 0;
   let updatedLabelsCount = 0;
   let updatedDescriptionsCount = 0;
@@ -15713,6 +15740,24 @@ async function synchronizePaperclipIssueStatuses(
             advancedSettings,
             followThroughAssigneeAgentId: transitionFollowThroughAssigneeAgentId
           });
+      // Paperclip rejects in_progress for an unassigned issue. Imported issues are created unassigned
+      // on purpose, so keep the current status and report a skip instead of a sync error. A configured
+      // default/executor assignee resolves above and keeps the normal path.
+      if (
+        nextStatus === 'in_progress'
+        && paperclipIssue.status !== 'in_progress'
+        && !paperclipIssueSyncContext.assignee
+        && !nextTransitionAssignee
+      ) {
+        const keptSkip = buildInProgressNeedsAssigneeSkip({
+          repositoryUrl: repository.url,
+          githubIssueNumber: githubIssue.number,
+          keptStatus: paperclipIssue.status
+        });
+        keptStatusSkips.push(keptSkip);
+        ctx.logger.info('GitHub Sync kept the Paperclip issue status.', { ...keptSkip });
+        nextStatus = paperclipIssue.status;
+      }
       const shouldClearTransitionAssignee =
         nextStatus === 'in_review'
         && (nextTransitionAssignee === null || shouldPreserveMaintainerWaitRouting);
@@ -15937,7 +15982,8 @@ async function synchronizePaperclipIssueStatuses(
     updatedStatusesCount,
     updatedLabelsCount,
     updatedDescriptionsCount,
-    driftedDescriptionsCount
+    driftedDescriptionsCount,
+    keptStatusSkips
   };
 }
 
@@ -22000,6 +22046,7 @@ async function performSync(
   let updatedLabelsCount = 0;
   let updatedDescriptionsCount = 0;
   let driftedDescriptionsCount = 0;
+  const keptStatusSkips: KeptStatusSkip[] = [];
   const recoverableFailures: SyncProcessingFailure[] = [];
   const nextRegistry = [...importRegistry];
   const companyLabelDirectoryCache = new Map<string, PaperclipLabelDirectory>();
@@ -22617,6 +22664,7 @@ async function performSync(
         updatedLabelsCount += synchronizationResult.updatedLabelsCount;
         updatedDescriptionsCount += synchronizationResult.updatedDescriptionsCount;
         driftedDescriptionsCount += synchronizationResult.driftedDescriptionsCount ?? 0;
+        keptStatusSkips.push(...(synchronizationResult.keptStatusSkips ?? []));
 
         const pullRequestSynchronizationResult = await synchronizePaperclipPullRequestIssueStatuses(
           ctx,
@@ -22796,6 +22844,7 @@ async function performSync(
         updatedLabelsCount += synchronizationResult.updatedLabelsCount;
         updatedDescriptionsCount += synchronizationResult.updatedDescriptionsCount;
         driftedDescriptionsCount += synchronizationResult.driftedDescriptionsCount ?? 0;
+        keptStatusSkips.push(...(synchronizationResult.keptStatusSkips ?? []));
       } catch (error) {
         if (error instanceof SyncCancellationError || isGitHubRateLimitError(error)) {
           throw error;
@@ -22915,7 +22964,7 @@ async function performSync(
     const skippedByAgeSummary = formatSkippedByAgeSummary(skippedByAgeEntries);
     const nextSyncState = {
       status: 'success' as const,
-      message: `${options.target ? `GitHub sync for ${options.target.displayLabel} is complete. ` : 'Sync complete. '}Imported ${createdIssuesCount} issues, updated ${updatedStatusesCount} issue status${updatedStatusesCount === 1 ? '' : 'es'}, updated ${updatedLabelsCount} issue label set${updatedLabelsCount === 1 ? '' : 's'}, updated ${updatedDescriptionsCount} issue description${updatedDescriptionsCount === 1 ? '' : 's'}${driftedDescriptionsCount > 0 ? `, left ${driftedDescriptionsCount} drifted issue description${driftedDescriptionsCount === 1 ? '' : 's'} untouched` : ''}, and skipped ${skippedIssuesCount} already-synced issue${skippedIssuesCount === 1 ? '' : 's'}.${skippedByAgeSummary ? ` Age filter: ${skippedByAgeSummary}.` : ''}`,
+      message: `${options.target ? `GitHub sync for ${options.target.displayLabel} is complete. ` : 'Sync complete. '}Imported ${createdIssuesCount} issues, updated ${updatedStatusesCount} issue status${updatedStatusesCount === 1 ? '' : 'es'}, updated ${updatedLabelsCount} issue label set${updatedLabelsCount === 1 ? '' : 's'}, updated ${updatedDescriptionsCount} issue description${updatedDescriptionsCount === 1 ? '' : 's'}${driftedDescriptionsCount > 0 ? `, left ${driftedDescriptionsCount} drifted issue description${driftedDescriptionsCount === 1 ? '' : 's'} untouched` : ''}${keptStatusSkips.length > 0 ? `, kept ${keptStatusSkips.length} issue status${keptStatusSkips.length === 1 ? '' : 'es'} unchanged (${formatKeptStatusSkipSummary(keptStatusSkips)})` : ''}, and skipped ${skippedIssuesCount} already-synced issue${skippedIssuesCount === 1 ? '' : 's'}.${skippedByAgeSummary ? ` Age filter: ${skippedByAgeSummary}.` : ''}`,
       checkedAt: new Date().toISOString(),
       syncedIssuesCount,
       createdIssuesCount,
