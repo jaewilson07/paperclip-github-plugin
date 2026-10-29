@@ -25124,7 +25124,8 @@ const plugin = definePlugin({
             reference: record.reference,
             repositoryUrl: normalizeOptionalString(record.repository),
             issueNumber: record.issueNumber,
-            requireUnlinked: true
+            requireUnlinked: true,
+            allowUnmapped: true
           })
         : linkPaperclipIssueToGitHubPullRequest(ctx, {
             companyId,
@@ -25134,6 +25135,7 @@ const plugin = definePlugin({
             pullRequestNumber: record.pullRequestNumber,
             pullRequestUrl: record.pullRequestUrl,
             requireUnlinked: true,
+            allowUnmapped: true,
             followThroughAssigneeAgentId: record.followThroughAssigneeAgentId
           });
     });

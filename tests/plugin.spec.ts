@@ -9382,6 +9382,182 @@ test('issue.linkGitHubItem links a Paperclip issue to a GitHub issue and tracks 
   }
 });
 
+test('issue.linkGitHubItem links an issue in an unmapped project when the repository is named', async () => {
+  const harness = await createProjectPullRequestsHarness();
+  const originalFetch = globalThis.fetch;
+  const issue = await harness.ctx.issues.create({
+    companyId: 'company-1',
+    projectId: 'project-without-mapping',
+    title: 'Paperclip issue in a project with no repository mapping'
+  });
+
+  globalThis.fetch = async (input, init) => {
+    const requestUrl = getRequestUrl(input);
+    const requestPathname = getDecodedRequestPathname(input);
+
+    if (requestPathname === '/repos/paperclipai/unmapped-repo/issues/12') {
+      return jsonResponse({
+        id: 1200,
+        number: 12,
+        title: 'GitHub issue in a repository that is not mapped',
+        body: 'GitHub owns the delivery state.',
+        html_url: 'https://github.com/paperclipai/unmapped-repo/issues/12',
+        state: 'open',
+        state_reason: null,
+        comments: 0,
+        user: {
+          login: 'octocat',
+          html_url: 'https://github.com/octocat',
+          avatar_url: 'https://avatars.githubusercontent.com/u/583231?v=4'
+        },
+        labels: []
+      });
+    }
+
+    if (requestPathname === '/graphql') {
+      const { query, variables } = getGraphqlRequest(init);
+      if (query.includes('query GitHubIssueStatusSnapshot') && variables.issueNumber === 12) {
+        return graphqlResponse({
+          repository: {
+            issue: {
+              closedByPullRequestsReferences: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: []
+              },
+              comments: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: []
+              }
+            }
+          }
+        });
+      }
+    }
+
+    throw new Error(`Unexpected fetch during unmapped GitHub issue link test: ${requestUrl}`);
+  };
+
+  try {
+    const result = await harness.performAction<{
+      kind: string;
+      githubIssueNumber?: number;
+      paperclipIssueId: string;
+    }>('issue.linkGitHubItem', {
+      companyId: 'company-1',
+      issueId: issue.id,
+      kind: 'issue',
+      repository: 'paperclipai/unmapped-repo',
+      reference: '12'
+    });
+
+    assert.equal(result.kind, 'issue');
+    assert.equal(result.githubIssueNumber, 12);
+    assert.equal(result.paperclipIssueId, issue.id);
+
+    const issueLinks = await harness.ctx.entities.list({
+      entityType: 'paperclip-github-plugin.issue-link',
+      scopeKind: 'issue',
+      scopeId: issue.id
+    });
+    assert.equal(issueLinks.length, 1);
+    assert.equal(issueLinks[0]?.externalId, 'https://github.com/paperclipai/unmapped-repo/issues/12');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('issue.linkGitHubItem lets a mapped project link an issue in another named repository', async () => {
+  const harness = await createProjectPullRequestsHarness();
+  const originalFetch = globalThis.fetch;
+  const issue = await harness.ctx.issues.create({
+    companyId: 'company-1',
+    projectId: 'project-1',
+    title: 'Work that spans two repositories'
+  });
+
+  globalThis.fetch = async (input, init) => {
+    const requestUrl = getRequestUrl(input);
+    const requestPathname = getDecodedRequestPathname(input);
+
+    if (requestPathname === '/repos/paperclipai/second-repo/issues/5') {
+      return jsonResponse({
+        id: 500,
+        number: 5,
+        title: 'Second repository half of the work',
+        body: '',
+        html_url: 'https://github.com/paperclipai/second-repo/issues/5',
+        state: 'open',
+        state_reason: null,
+        comments: 0,
+        user: { login: 'octocat', html_url: 'https://github.com/octocat', avatar_url: 'https://avatars.githubusercontent.com/u/583231?v=4' },
+        labels: []
+      });
+    }
+
+    if (requestPathname === '/graphql') {
+      const { query, variables } = getGraphqlRequest(init);
+      if (query.includes('query GitHubIssueStatusSnapshot') && variables.issueNumber === 5) {
+        return graphqlResponse({
+          repository: {
+            issue: {
+              closedByPullRequestsReferences: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] },
+              comments: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
+            }
+          }
+        });
+      }
+    }
+
+    throw new Error(`Unexpected fetch during cross-repository link test: ${requestUrl}`);
+  };
+
+  try {
+    const result = await harness.performAction<{ githubIssueNumber?: number }>('issue.linkGitHubItem', {
+      companyId: 'company-1',
+      issueId: issue.id,
+      kind: 'issue',
+      repository: 'paperclipai/second-repo',
+      reference: '5'
+    });
+    assert.equal(result.githubIssueNumber, 5);
+
+    const issueLinks = await harness.ctx.entities.list({
+      entityType: 'paperclip-github-plugin.issue-link',
+      scopeKind: 'issue',
+      scopeId: issue.id
+    });
+    assert.equal(issueLinks[0]?.externalId, 'https://github.com/paperclipai/second-repo/issues/5');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('issue.linkGitHubItem still requires a repository when the project is not mapped', async () => {
+  const harness = await createProjectPullRequestsHarness();
+  const issue = await harness.ctx.issues.create({
+    companyId: 'company-1',
+    projectId: 'project-without-mapping',
+    title: 'Unmapped project, bare issue number'
+  });
+
+  await assert.rejects(
+    harness.performAction('issue.linkGitHubItem', {
+      companyId: 'company-1',
+      issueId: issue.id,
+      kind: 'issue',
+      reference: '12'
+    }),
+    /Enter a full GitHub URL or repository/
+  );
+
+  const issueLinks = await harness.ctx.entities.list({
+    entityType: 'paperclip-github-plugin.issue-link',
+    scopeKind: 'issue',
+    scopeId: issue.id
+  });
+  assert.equal(issueLinks.length, 0);
+});
+
 test('entity-only issue links retain trusted comment watermarks across a failed action and worker restart', async () => {
   const harness = await createProjectPullRequestsHarness();
   const issue = await harness.ctx.issues.create({
