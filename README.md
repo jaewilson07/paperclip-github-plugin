@@ -164,6 +164,8 @@ npx paperclipai plugin install --local "$PWD"
 4. Add one or more repository mappings for the current company.
 5. For each mapping, either choose an existing GitHub-linked Paperclip project or enter the project name that should receive synced issues.
 6. Optionally configure company-wide defaults for imported issues, including the default assignee, the default Paperclip status, executor/reviewer/approver handoff assignees for sync-driven transitions, and ignored GitHub usernames. When Paperclip board access is connected, each assignee dropdown also offers `Me` for the connected board user. `Automatic routing` means GitHub Sync follows the issue's Paperclip execution policy first and only uses the saved fallback when Paperclip does not expose the next reviewer, approver, or return assignee yet. Bot aliases such as `renovate[bot]` are matched when you save `renovate`.
+
+   **Limit the import by recent activity (`importMaxAgeDays`).** Leave it empty and a mapping imports every open issue. Set it (1 to 3650 days) to import only open issues whose GitHub `updated_at` is within that many days, so mapping a large repository does not pull in its whole backlog. Set a company default under Advanced settings and override it per repository mapping (the mapping value wins). The rule is activity-based: a stale issue that gets a new comment re-qualifies on the next sync. It applies to new imports only: issues already imported or manually linked keep syncing at any age. The sync summary reports how many issues each mapping skipped (for example `https://github.com/owner/repo: skipped 143 older than 60 days`), and nothing is labelled, commented on or closed on GitHub. Saving a value outside 1 to 3650 is rejected. A suggested starting value for large repositories is 60.
 7. Choose the automatic sync interval in minutes.
 8. Save the settings and run the first manual sync.
 9. Repeat inside other companies if they need their own mappings, defaults, or board access.
@@ -176,6 +178,10 @@ When a token is saved, the settings page audits the mapped repositories for the 
 Imported issues keep the original GitHub title and use the normalized GitHub body as the Paperclip description. The worker also normalizes GitHub HTML that Paperclip descriptions do not render cleanly, including elements such as `<br>`, `<hr>`, `<details>`, `<summary>`, and inline images.
 
 To keep imported issues recognizable without cluttering the visible description, the plugin appends a hidden HTML comment footer with the source GitHub issue URL. Agents and repair flows use that marker when the plugin-owned link entity or import registry is missing.
+
+### Description drift
+
+Sync is one-way: GitHub to Paperclip. The plugin never writes to GitHub. It records a hash of the description it last wrote for each linked issue. If the Paperclip description no longer matches that hash (someone edited it), the sync skips the description, keeps syncing labels and status, and posts one comment with the Paperclip text and the GitHub text. The same pair of texts is not reported twice. The owning agent resolves it: move the extra text into a comment and use **Accept GitHub description** on the issue's GitHub tab, or change the GitHub body so the two match. The sync summary reports how many descriptions were left untouched. Issues with no stored hash (first sync after upgrading) adopt their current text as the baseline and are not reported as drift. Put durable instructions for linked issues in the GitHub body or in comments, not the Paperclip description.
 
 Repeated syncs keep existing imports current instead of creating duplicates again. If the plugin's import registry is stale, the worker can repair deduplication by reusing existing Paperclip issues when durable GitHub link metadata is already present.
 

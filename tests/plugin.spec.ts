@@ -9,6 +9,7 @@ import type { Agent, Project } from '@paperclipai/plugin-sdk';
 import { createTestHarness } from '@paperclipai/plugin-sdk/testing';
 
 import type { PublishLocalBranchInput, PublishedBranch } from '../src/git-branch-publisher.ts';
+import { resolveImportMaxAgeDays } from '../src/import-age-filter.ts';
 import manifest from '../src/manifest.ts';
 import {
   COMPANY_METRIC_API_ROUTE_KEY,
@@ -4305,6 +4306,196 @@ test('sync.runNow records backlog snapshots and closed-issue KPI activity for th
     };
 
     assert.equal(updatedCompanyKpis.activityRollupsByCompanyId?.['company-1']?.at(-1)?.githubIssuesClosedCount, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('settings.saveRegistration round-trips a per-mapping importMaxAgeDays that overrides the company default', async () => {
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRef: 'github-secret-ref'
+    }
+  });
+  await plugin.definition.setup(harness.ctx);
+
+  const saved = await harness.performAction('settings.saveRegistration', {
+    companyId: 'company-1',
+    mappings: [
+      {
+        id: 'mapping-a',
+        repositoryUrl: 'paperclipai/example-repo',
+        paperclipProjectName: 'Engineering',
+        paperclipProjectId: 'project-1',
+        companyId: 'company-1',
+        importMaxAgeDays: 30
+      },
+      {
+        id: 'mapping-b',
+        repositoryUrl: 'paperclipai/other-repo',
+        paperclipProjectName: 'Ops',
+        paperclipProjectId: 'project-2',
+        companyId: 'company-1'
+      }
+    ],
+    advancedSettings: { importMaxAgeDays: 60 }
+  }) as {
+    mappings: Array<{ id: string; importMaxAgeDays?: number }>;
+    advancedSettings: { importMaxAgeDays?: number };
+  };
+
+  assert.equal(saved.mappings.find((mapping) => mapping.id === 'mapping-a')?.importMaxAgeDays, 30);
+  assert.equal(saved.mappings.find((mapping) => mapping.id === 'mapping-b')?.importMaxAgeDays, undefined);
+  assert.equal(saved.advancedSettings.importMaxAgeDays, 60);
+
+  const stored = harness.getState({
+    scopeKind: 'instance',
+    stateKey: 'paperclip-github-plugin-settings'
+  }) as { mappings: Array<{ id: string; importMaxAgeDays?: number }> };
+  assert.equal(stored.mappings.find((mapping) => mapping.id === 'mapping-a')?.importMaxAgeDays, 30);
+
+  const readBack = await harness.getData('settings.registration', { companyId: 'company-1' }) as {
+    mappings: Array<{ id: string; importMaxAgeDays?: number }>;
+  };
+  assert.equal(readBack.mappings.find((mapping) => mapping.id === 'mapping-a')?.importMaxAgeDays, 30);
+
+  assert.equal(resolveImportMaxAgeDays(stored.mappings[0]?.importMaxAgeDays, saved.advancedSettings.importMaxAgeDays), 30);
+  assert.equal(resolveImportMaxAgeDays(stored.mappings[1]?.importMaxAgeDays, saved.advancedSettings.importMaxAgeDays), 60);
+});
+
+test('sync.runNow with importMaxAgeDays skips stale new issues, keeps syncing imported ones, and reports counts', async () => {
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRef: 'github-secret-ref'
+    }
+  });
+  await plugin.definition.setup(harness.ctx);
+
+  const rejected = await harness.performAction('settings.saveRegistration', {
+    companyId: 'company-1',
+    advancedSettings: { importMaxAgeDays: 0 }
+  }).then(() => null, (error: unknown) => error);
+  assert.match(String((rejected as Error | null)?.message), /importMaxAgeDays must be a whole number/);
+
+  await harness.performAction('settings.saveRegistration', {
+    companyId: 'company-1',
+    mappings: [
+      {
+        id: 'mapping-a',
+        repositoryUrl: 'paperclipai/example-repo',
+        paperclipProjectName: 'Engineering',
+        paperclipProjectId: 'project-1',
+        companyId: 'company-1'
+      }
+    ],
+    advancedSettings: { importMaxAgeDays: 60 }
+  });
+
+  const alreadyImportedOldIssue = await harness.ctx.issues.create({
+    companyId: 'company-1',
+    projectId: 'project-1',
+    title: 'Old but already imported'
+  });
+  await harness.ctx.state.set(
+    { scopeKind: 'instance', stateKey: 'paperclip-github-plugin-import-registry' },
+    [
+      {
+        mappingId: 'mapping-a',
+        githubIssueId: 6102,
+        githubIssueNumber: 62,
+        paperclipIssueId: alreadyImportedOldIssue.id,
+        importedAt: '2026-01-09T09:00:00.000Z',
+        lastSeenCommentCount: 0,
+        lastSeenGitHubState: 'open'
+      }
+    ]
+  );
+
+  const daysAgo = (days: number) => new Date(Date.now() - days * 86_400_000).toISOString();
+  const githubIssues = [
+    { id: 6100, number: 60, title: 'Recent issue', updated_at: daysAgo(3) },
+    { id: 6101, number: 61, title: 'Stale never-imported issue', updated_at: daysAgo(200) },
+    { id: 6102, number: 62, title: 'Old but already imported', updated_at: daysAgo(200) }
+  ].map((issue) => ({
+    ...issue,
+    body: 'body',
+    html_url: `https://github.com/paperclipai/example-repo/issues/${issue.number}`,
+    state: 'open',
+    comments: 0
+  }));
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+
+    if (url.pathname === '/repos/paperclipai/example-repo/issues') {
+      return jsonResponse(githubIssues);
+    }
+
+    if (url.pathname === '/graphql') {
+      const { query, variables } = getGraphqlRequest(init);
+      const issueNumber = typeof variables.issueNumber === 'number' ? variables.issueNumber : undefined;
+
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse(githubIssues.map((issue) => ({ issueNumber: issue.number })));
+      }
+
+      if (query.includes('query GitHubRepositoryOpenIssueLinkedPullRequests')) {
+        return graphqlResponse({
+          repository: {
+            issues: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: []
+            }
+          }
+        });
+      }
+
+      if (query.includes('query GitHubIssueStatusSnapshot')) {
+        return graphqlResponse({
+          repository: {
+            issue: {
+              number: issueNumber,
+              state: 'OPEN',
+              stateReason: null,
+              comments: { totalCount: 0 },
+              closedByPullRequestsReferences: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: []
+              }
+            }
+          }
+        });
+      }
+    }
+
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  try {
+    const sync = await harness.performAction('sync.runNow', {
+      companyId: 'company-1',
+      waitForCompletion: true
+    }) as { syncState: { status: string; message?: string; createdIssuesCount?: number; syncedIssuesCount?: number } };
+
+    assert.equal(sync.syncState.status, 'success');
+    assert.equal(sync.syncState.createdIssuesCount, 1);
+    assert.equal(sync.syncState.syncedIssuesCount, 2);
+    assert.match(sync.syncState.message ?? '', /skipped 1 older than 60 days/);
+
+    const titles = (await harness.ctx.issues.list({ companyId: 'company-1', projectId: 'project-1' }))
+      .map((issue) => issue.title);
+    assert.ok(titles.some((title) => title.includes('Recent issue')));
+    assert.ok(!titles.some((title) => title.includes('Stale never-imported issue')));
+
+    const importRegistry = harness.getState({
+      scopeKind: 'instance',
+      stateKey: 'paperclip-github-plugin-import-registry'
+    }) as Array<{ githubIssueId?: number }>;
+    assert.ok(importRegistry.some((entry) => entry.githubIssueId === 6102));
+    assert.ok(!importRegistry.some((entry) => entry.githubIssueId === 6101));
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -19913,6 +20104,8 @@ test('worker resyncs imported issue descriptions when the GitHub body changes la
         companyId: 'company-1'
       }
     ],
+    companyId: 'company-1',
+    advancedSettings: { defaultAssigneeAgentId: 'agent-default' },
     syncState: {
       status: 'idle'
     }
@@ -20076,6 +20269,391 @@ test('worker resyncs imported issue descriptions when the GitHub body changes la
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('worker reports description drift instead of overwriting an edited Paperclip description', async () => {
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRef: 'github-secret-ref'
+    }
+  });
+  await plugin.definition.setup(harness.ctx);
+
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      {
+        id: 'mapping-a',
+        repositoryUrl: 'paperclipai/example-repo',
+        paperclipProjectName: 'Engineering',
+        paperclipProjectId: 'project-1',
+        companyId: 'company-1'
+      }
+    ],
+    companyId: 'company-1',
+    advancedSettings: { defaultAssigneeAgentId: 'agent-default' },
+    syncState: {
+      status: 'idle'
+    }
+  });
+
+  const statusTransitionComments: Array<{ issueId: string; body: string }> = [];
+  const originalCreateComment = harness.ctx.issues.createComment;
+  harness.ctx.issues.createComment = async (issueId, body, companyId) => {
+    statusTransitionComments.push({ issueId, body });
+    return originalCreateComment(issueId, body, companyId);
+  };
+
+  let syncRun = 0;
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (input, init) => {
+    const rawUrl = getRequestUrl(input);
+    const url = new URL(rawUrl);
+
+    if (url.pathname === '/repos/paperclipai/example-repo/issues' && ['all', 'open'].includes(url.searchParams.get('state') ?? '')) {
+      return jsonResponse([
+        {
+          id: 2601,
+          number: 26,
+          title: 'Description drift after edit',
+          body: syncRun === 0 ? 'Original body' : 'Updated body from GitHub',
+          html_url: 'https://github.com/paperclipai/example-repo/issues/26',
+          state: 'open'
+        }
+      ]);
+    }
+
+    if (url.pathname === '/graphql') {
+      const { query, variables } = getGraphqlRequest(init);
+      const issueNumber = typeof variables.issueNumber === 'number' ? variables.issueNumber : undefined;
+
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([
+          {
+            issueNumber: 26
+          }
+        ]);
+      }
+
+      if (query.includes('query GitHubIssueStatusSnapshot') && issueNumber === 26) {
+        return graphqlResponse({
+          repository: {
+            issue: {
+              number: 26,
+              state: 'OPEN',
+              stateReason: null,
+              comments: {
+                totalCount: 0
+              },
+              closedByPullRequestsReferences: {
+                pageInfo: {
+                  hasNextPage: false,
+                  endCursor: null
+                },
+                nodes: [
+                  {
+                    number: 260,
+                    state: 'OPEN'
+                  }
+                ]
+              }
+            }
+          }
+        });
+      }
+
+      if (query.includes('query GitHubPullRequestReviewThreads')) {
+        return graphqlResponse({
+          repository: {
+            pullRequest: {
+              reviewThreads: {
+                pageInfo: {
+                  hasNextPage: false,
+                  endCursor: null
+                },
+                nodes: [{ isResolved: true }]
+              }
+            }
+          }
+        });
+      }
+
+      if (query.includes('query GitHubPullRequestCiContexts')) {
+        return graphqlResponse({
+          repository: {
+            pullRequest: {
+              statusCheckRollup: {
+                contexts: {
+                  pageInfo: {
+                    hasNextPage: false,
+                    endCursor: null
+                  },
+                  nodes: [
+                    {
+                      __typename: 'StatusContext',
+                      state: 'SUCCESS'
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        });
+      }
+    }
+
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  try {
+    const firstSync = await harness.performAction('sync.runNow', {}) as {
+      syncState: { status: string; message?: string };
+    };
+
+    assert.equal(firstSync.syncState.status, 'success');
+
+    const importedIssue = (await harness.ctx.issues.list({
+      companyId: 'company-1'
+    })).find((issue) => issue.title === 'Description drift after edit');
+
+    assert.ok(importedIssue);
+    assert.doesNotMatch(importedIssue?.description ?? '', /^\*\s+GitHub issue:/m);
+    assert.match(importedIssue?.description ?? '', /Original body/);
+    assert.equal(statusTransitionComments.length, 1);
+
+    const githubDetailsAfterFirstSync = await harness.getData<{
+      githubIssueNumber: number;
+      linkedPullRequestNumbers: number[];
+    } | null>('issue.githubDetails', {
+      companyId: 'company-1',
+      issueId: importedIssue?.id
+    });
+
+    assert.equal(githubDetailsAfterFirstSync?.githubIssueNumber, 26);
+    assert.deepEqual(githubDetailsAfterFirstSync?.linkedPullRequestNumbers, [260]);
+
+    const driftComments = () => statusTransitionComments.filter((comment) => comment.body.includes('GitHub Sync: description drift'));
+    const findIssue = async () => (await harness.ctx.issues.list({ companyId: 'company-1' }))
+      .find((issue) => issue.title === 'Description drift after edit');
+
+    // Unedited Paperclip text keeps syncing from GitHub as before.
+    assert.equal(driftComments().length, 0);
+
+    // An owner edits the Paperclip description, then GitHub changes too.
+    const editedDescription = `${importedIssue.description}\n\nOwner notes that must not be lost`;
+    await harness.ctx.issues.update(importedIssue.id, { description: editedDescription }, 'company-1');
+    syncRun = 1;
+
+    const secondSync = await harness.performAction('sync.runNow', {}) as {
+      syncState: { status: string; message?: string };
+    };
+    assert.equal(secondSync.syncState.status, 'success');
+    assert.match(secondSync.syncState.message ?? '', /left 1 drifted issue description untouched/);
+    assert.doesNotMatch(secondSync.syncState.message ?? '', /updated [1-9]\d* issue description/);
+    assert.equal((await findIssue())?.description, editedDescription);
+    assert.equal(driftComments().length, 1);
+    assert.match(driftComments()[0].body, /Owner notes that must not be lost/);
+    assert.match(driftComments()[0].body, /Updated body from GitHub/);
+
+    // The same pair of texts is not reported twice.
+    await harness.performAction('sync.runNow', {});
+    assert.equal(driftComments().length, 1);
+    assert.equal((await findIssue())?.description, editedDescription);
+
+    // "Accept GitHub" resumes description sync.
+    await harness.performAction('issue.acceptGitHubDescription', {
+      companyId: 'company-1',
+      issueId: importedIssue.id
+    });
+    const afterAccept = await harness.performAction('sync.runNow', {}) as {
+      syncState: { status: string; message?: string };
+    };
+    assert.match(afterAccept.syncState.message ?? '', /updated 1 issue description/);
+    const accepted = await findIssue();
+    assert.match(accepted?.description ?? '', /Updated body from GitHub/);
+    assert.doesNotMatch(accepted?.description ?? '', /Owner notes/);
+    assert.equal(driftComments().length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+async function runUnassignedInProgressScenario(options: {
+  advancedSettings?: Record<string, unknown>;
+  assignIssueAfterImport?: { assigneeAgentId: string };
+}) {
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRef: 'github-secret-ref'
+    }
+  });
+  await plugin.definition.setup(harness.ctx);
+
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      {
+        id: 'mapping-a',
+        repositoryUrl: 'paperclipai/example-repo',
+        paperclipProjectName: 'Engineering',
+        paperclipProjectId: 'project-1',
+        companyId: 'company-1'
+      }
+    ],
+    companyId: 'company-1',
+    ...(options.advancedSettings ? { advancedSettings: options.advancedSettings } : {}),
+    syncState: {
+      status: 'idle'
+    }
+  });
+
+  // Mirror the Paperclip host rule that rejects in_progress for unassigned issues.
+  const originalUpdate = harness.ctx.issues.update.bind(harness.ctx.issues);
+  const updateAttempts: Array<Record<string, unknown>> = [];
+  harness.ctx.issues.update = async (issueId, patch, companyId) => {
+    updateAttempts.push({ ...patch });
+    if (patch.status === 'in_progress') {
+      const existing = await harness.ctx.issues.get(issueId, companyId);
+      const hasAssignee = Boolean(patch.assigneeAgentId ?? patch.assigneeUserId ?? existing?.assigneeAgentId ?? existing?.assigneeUserId);
+      if (!hasAssignee) {
+        throw new Error('in_progress issues require an assignee');
+      }
+    }
+    return originalUpdate(issueId, patch, companyId);
+  };
+
+  let syncRun = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+
+    if (url.pathname === '/repos/paperclipai/example-repo/issues' && ['all', 'open'].includes(url.searchParams.get('state') ?? '')) {
+      return jsonResponse([
+        {
+          id: 2701,
+          number: 27,
+          title: 'Unassigned in progress',
+          body: 'Body',
+          html_url: 'https://github.com/paperclipai/example-repo/issues/27',
+          state: 'open'
+        }
+      ]);
+    }
+
+    if (url.pathname === '/graphql') {
+      const { query, variables } = getGraphqlRequest(init);
+      const issueNumber = typeof variables.issueNumber === 'number' ? variables.issueNumber : undefined;
+
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([{ issueNumber: 27 }]);
+      }
+
+      if (query.includes('query GitHubIssueStatusSnapshot') && issueNumber === 27) {
+        return graphqlResponse({
+          repository: {
+            issue: {
+              number: 27,
+              state: 'OPEN',
+              stateReason: null,
+              comments: { totalCount: 0 },
+              closedByPullRequestsReferences: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: syncRun === 0 ? [] : [{ number: 270, state: 'OPEN' }]
+              }
+            }
+          }
+        });
+      }
+
+      if (query.includes('query GitHubPullRequestReviewThreads')) {
+        return graphqlResponse({
+          repository: {
+            pullRequest: {
+              reviewThreads: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [{ isResolved: true }]
+              }
+            }
+          }
+        });
+      }
+
+      if (query.includes('query GitHubPullRequestCiContexts')) {
+        return graphqlResponse({
+          repository: {
+            pullRequest: {
+              statusCheckRollup: {
+                contexts: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  nodes: [{ __typename: 'StatusContext', state: 'PENDING' }]
+                }
+              }
+            }
+          }
+        });
+      }
+    }
+
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  try {
+    const firstSync = await harness.performAction('sync.runNow', {}) as {
+      syncState: { status: string; message?: string };
+    };
+    assert.equal(firstSync.syncState.status, 'success');
+
+    const findIssue = async () => (await harness.ctx.issues.list({ companyId: 'company-1' }))
+      .find((issue) => issue.title === 'Unassigned in progress');
+    const importedIssue = await findIssue();
+    assert.ok(importedIssue);
+    // Backlog is manual-only after import, so start from todo like an issue a human triaged.
+    await originalUpdate(importedIssue.id, { status: 'todo', ...options.assignIssueAfterImport }, 'company-1');
+    const statusBefore = 'todo';
+    updateAttempts.length = 0;
+    syncRun = 1;
+
+    const secondSync = await harness.performAction('sync.runNow', {}) as {
+      syncState: { status: string; message?: string; erroredIssuesCount?: number };
+    };
+    const issueAfter = await findIssue();
+    return { secondSync, issueAfter, statusBefore, updateAttempts, harness };
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+test('sync keeps the current status and reports a skip when in_progress needs an assignee', async () => {
+  const { secondSync, issueAfter, statusBefore, updateAttempts } = await runUnassignedInProgressScenario({});
+
+  assert.equal(secondSync.syncState.status, 'success');
+  assert.equal(secondSync.syncState.erroredIssuesCount ?? 0, 0);
+  assert.match(secondSync.syncState.message ?? '', /kept 1 issue status unchanged/);
+  assert.match(secondSync.syncState.message ?? '', /example-repo#27 kept todo: in_progress needs an assignee/);
+  assert.equal(issueAfter?.status, statusBefore);
+  assert.equal(updateAttempts.some((patch) => patch.status === 'in_progress'), false);
+});
+
+test('sync still moves an assigned issue to in_progress', async () => {
+  const { secondSync, issueAfter } = await runUnassignedInProgressScenario({
+    assignIssueAfterImport: { assigneeAgentId: 'agent-1' }
+  });
+
+  assert.equal(secondSync.syncState.status, 'success');
+  assert.doesNotMatch(secondSync.syncState.message ?? '', /unchanged/);
+  assert.equal(issueAfter?.status, 'in_progress');
+});
+
+test('sync still applies a configured default assignee when moving to in_progress', async () => {
+  const { secondSync, issueAfter } = await runUnassignedInProgressScenario({
+    advancedSettings: { defaultAssigneeAgentId: 'agent-default', executorAssigneeAgentId: 'agent-default' }
+  });
+
+  assert.equal(secondSync.syncState.status, 'success');
+  assert.doesNotMatch(secondSync.syncState.message ?? '', /unchanged/);
+  assert.equal(issueAfter?.status, 'in_progress');
+  assert.equal(issueAfter?.assigneeAgentId, 'agent-default');
 });
 
 test('get_issue resolves imported Paperclip issues from the hidden description marker when registry and entities are missing', async () => {

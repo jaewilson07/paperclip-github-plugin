@@ -1,5 +1,13 @@
 import { Buffer } from 'node:buffer';
 import { createHash, randomUUID } from 'node:crypto';
+import { buildDescriptionDriftComment, decideDescriptionDrift, hashDescription } from './description-drift.ts';
+import {
+  formatSkippedByAgeSummary,
+  normalizeImportMaxAgeDays,
+  partitionIssuesByImportAge,
+  resolveImportMaxAgeDays,
+  validateImportMaxAgeDays
+} from './import-age-filter.ts';
 import { realpathSync } from 'node:fs';
 import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -269,6 +277,8 @@ interface RepositoryMapping {
   paperclipProjectName: string;
   paperclipProjectId?: string;
   companyId?: string;
+  /** Per-mapping override of the company importMaxAgeDays default. */
+  importMaxAgeDays?: number;
 }
 
 interface GitHubSyncAdvancedSettings {
@@ -282,6 +292,8 @@ interface GitHubSyncAdvancedSettings {
   approverAssigneeUserId?: string;
   defaultStatus: PaperclipIssueStatus;
   ignoredIssueAuthorUsernames: string[];
+  /** Import only open issues updated within this many days. Unset imports everything. */
+  importMaxAgeDays?: number;
 }
 
 interface GitHubSyncAssigneeOption {
@@ -432,6 +444,10 @@ interface ImportedIssueRecord {
   /** External PR state the last time sync pulled this issue out of `blocked`. See shouldPreserveDeliberateBlockedWait. */
   unblockedExternalStateHash?: string;
   activationPending?: boolean;
+  /** Hash of the Paperclip description the plugin last wrote or adopted. A different hash means someone edited it. */
+  descriptionHash?: string;
+  /** Hash pair of the texts a description-drift comment was last posted for. */
+  descriptionDriftKey?: string;
   repositoryUrl?: string;
   paperclipProjectId?: string;
   companyId?: string;
@@ -812,6 +828,7 @@ interface GitHubIssueRecord {
   state: 'open' | 'closed';
   stateReason?: GitHubIssueStateReason;
   commentsCount: number;
+  updatedAt?: string;
 }
 
 interface RepositorySyncPlan {
@@ -824,6 +841,8 @@ interface RepositorySyncPlan {
   allIssuesById: Map<number, GitHubIssueRecord>;
   pullRequestLinks: GitHubPullRequestLinkRecord[];
   trackedIssueCount: number;
+  skippedByAgeCount: number;
+  importMaxAgeDays?: number;
 }
 
 interface ExternalGitHubLinkSyncWork {
@@ -875,6 +894,7 @@ interface GitHubApiIssueRecord {
   } | null;
   state: string;
   comments?: number;
+  updated_at?: string | null;
   state_reason?: string | null;
   author_association?: string | null;
   labels?: GitHubApiIssueLabelRecord[];
@@ -5978,13 +5998,15 @@ function normalizeMappings(value: unknown): RepositoryMapping[] {
     const paperclipProjectId = typeof record.paperclipProjectId === 'string' ? record.paperclipProjectId : undefined;
     const companyId = normalizeCompanyId(record.companyId);
     const parsedRepository = parseRepositoryReference(repositoryInput);
+    const importMaxAgeDays = normalizeImportMaxAgeDays(record.importMaxAgeDays);
 
     return {
       id,
       repositoryUrl: parsedRepository?.url ?? repositoryInput.trim(),
       paperclipProjectName,
       paperclipProjectId,
-      companyId
+      companyId,
+      ...(importMaxAgeDays !== undefined ? { importMaxAgeDays } : {})
     };
   });
 }
@@ -6088,6 +6110,7 @@ function normalizeAdvancedSettings(value: unknown): GitHubSyncAdvancedSettings {
     'ignoredIssueAuthorUsernames' in record
       ? normalizeIgnoredIssueAuthorUsernames(record.ignoredIssueAuthorUsernames)
       : DEFAULT_ADVANCED_SETTINGS.ignoredIssueAuthorUsernames;
+  const importMaxAgeDays = normalizeImportMaxAgeDays(record.importMaxAgeDays);
   return {
     ...normalizeAdvancedSettingsAssigneeOverride(record, {
       agentId: 'defaultAssigneeAgentId',
@@ -6106,7 +6129,8 @@ function normalizeAdvancedSettings(value: unknown): GitHubSyncAdvancedSettings {
       userId: 'approverAssigneeUserId'
     }),
     defaultStatus,
-    ignoredIssueAuthorUsernames
+    ignoredIssueAuthorUsernames,
+    ...(importMaxAgeDays !== undefined ? { importMaxAgeDays } : {})
   };
 }
 
@@ -7036,6 +7060,8 @@ function normalizeImportRegistry(value: unknown): ImportedIssueRecord[] {
       const selectedPullRequestGate = normalizeSelectedPullRequestGate(record.selectedPullRequestGate);
       const pendingRemoteActionWake = normalizePendingRemoteActionWake(record.pendingRemoteActionWake);
       const activationPending = record.activationPending === true;
+      const descriptionHash = typeof record.descriptionHash === 'string' && record.descriptionHash ? record.descriptionHash : undefined;
+      const descriptionDriftKey = typeof record.descriptionDriftKey === 'string' && record.descriptionDriftKey ? record.descriptionDriftKey : undefined;
 
       if (!mappingId || Number.isNaN(githubIssueId) || !paperclipIssueId || !importedAt) {
         return null;
@@ -7056,7 +7082,9 @@ function normalizeImportRegistry(value: unknown): ImportedIssueRecord[] {
         ...(remoteActionFingerprint ? { remoteActionFingerprint } : {}),
         ...(selectedPullRequestGate ? { selectedPullRequestGate } : {}),
         ...(pendingRemoteActionWake ? { pendingRemoteActionWake } : {}),
-        ...(activationPending ? { activationPending: true } : {})
+        ...(activationPending ? { activationPending: true } : {}),
+        ...(descriptionHash ? { descriptionHash } : {}),
+        ...(descriptionDriftKey ? { descriptionDriftKey } : {})
       };
     })
     .filter((entry): entry is ImportedIssueRecord => entry !== null);
@@ -7424,7 +7452,8 @@ function normalizeGitHubIssueRecord(issue: GitHubApiIssueRecord): GitHubIssueRec
     labels: normalizeGitHubIssueLabels(issue.labels),
     state: issue.state === 'closed' ? 'closed' : 'open',
     stateReason: normalizeGitHubIssueStateReason(issue.state_reason),
-    commentsCount: typeof issue.comments === 'number' && issue.comments >= 0 ? Math.floor(issue.comments) : 0
+    commentsCount: typeof issue.comments === 'number' && issue.comments >= 0 ? Math.floor(issue.comments) : 0,
+    ...(typeof issue.updated_at === 'string' && issue.updated_at ? { updatedAt: issue.updated_at } : {})
   };
 }
 
@@ -13669,6 +13698,76 @@ async function synchronizePaperclipIssueLabels(
   return true;
 }
 
+/**
+ * One-way description sync with drift protection. GitHub stays the source and nothing is written to GitHub.
+ * If the Paperclip description was edited since the plugin last wrote it, the description is left alone and
+ * one comment records both texts for the owning agent to resolve.
+ */
+async function synchronizePaperclipIssueDescriptionWithDriftGuard(
+  ctx: PluginSetupContext,
+  params: {
+    companyId: string;
+    importedIssue: ImportedIssueRecord;
+    currentDescription?: string | null;
+    githubIssue: GitHubIssueRecord;
+    linkedPullRequestNumbers: number[];
+    paperclipApiBaseUrl?: string;
+    persistImportRegistry: () => Promise<void>;
+  }
+): Promise<{ updated: boolean; drifted: boolean }> {
+  const { importedIssue, githubIssue } = params;
+  const nextDescription = buildPaperclipIssueDescription(githubIssue, params.linkedPullRequestNumbers);
+  const decision = decideDescriptionDrift({
+    currentDescription: params.currentDescription,
+    nextDescription,
+    storedHash: importedIssue.descriptionHash,
+    storedDriftKey: importedIssue.descriptionDriftKey
+  });
+
+  if (decision.action === 'drift') {
+    if (decision.report) {
+      if (!ctx.issues || typeof ctx.issues.createComment !== 'function') {
+        // Without a way to report it, still never overwrite.
+        return { updated: false, drifted: true };
+      }
+      await ctx.issues.createComment(
+        importedIssue.paperclipIssueId,
+        buildDescriptionDriftComment({
+          githubIssueUrl: githubIssue.htmlUrl,
+          paperclipDescription: params.currentDescription,
+          githubDescription: nextDescription
+        }),
+        params.companyId
+      );
+      importedIssue.descriptionDriftKey = decision.driftKey;
+      await params.persistImportRegistry();
+    }
+    return { updated: false, drifted: true };
+  }
+
+  const updated = decision.action === 'write'
+    ? await synchronizePaperclipIssueDescription(ctx, {
+        companyId: params.companyId,
+        issueId: importedIssue.paperclipIssueId,
+        currentDescription: params.currentDescription,
+        githubIssue,
+        linkedPullRequestNumbers: params.linkedPullRequestNumbers,
+        paperclipApiBaseUrl: params.paperclipApiBaseUrl
+      })
+    : false;
+
+  // An unsuccessful write leaves the old hash alone so the next sync can retry.
+  if (decision.action === 'in_sync' || updated) {
+    const nextHash = hashDescription(nextDescription);
+    if (importedIssue.descriptionHash !== nextHash || importedIssue.descriptionDriftKey !== undefined) {
+      importedIssue.descriptionHash = nextHash;
+      delete importedIssue.descriptionDriftKey;
+      await params.persistImportRegistry();
+    }
+  }
+  return { updated, drifted: false };
+}
+
 async function synchronizePaperclipIssueDescription(
   ctx: PluginSetupContext,
   params: {
@@ -15026,6 +15125,30 @@ async function moveImportedIssueToTransferredGitHubMapping(
   };
 }
 
+interface KeptStatusSkip {
+  repositoryUrl: string;
+  githubIssueNumber: number;
+  keptStatus: PaperclipIssueStatus;
+  reason: string;
+}
+
+function buildInProgressNeedsAssigneeSkip(params: {
+  repositoryUrl: string;
+  githubIssueNumber: number;
+  keptStatus: PaperclipIssueStatus;
+}): KeptStatusSkip {
+  return {
+    ...params,
+    reason: `kept ${formatPaperclipIssueStatus(params.keptStatus)}: in_progress needs an assignee`
+  };
+}
+
+function formatKeptStatusSkipSummary(skips: KeptStatusSkip[]): string {
+  const shown = skips.slice(0, 5).map((skip) => `${skip.repositoryUrl.replace(/^https:\/\/github\.com\//, '')}#${skip.githubIssueNumber} ${skip.reason}`);
+  const extra = skips.length - shown.length;
+  return `${shown.join('; ')}${extra > 0 ? `; and ${extra} more` : ''}`;
+}
+
 function buildUnmappedTransferredIssueCancellationComment(params: {
   previousStatus: PaperclipIssueStatus;
   nextStatus: PaperclipIssueStatus;
@@ -15255,6 +15378,8 @@ async function synchronizePaperclipIssueStatuses(
   updatedStatusesCount: number;
   updatedLabelsCount: number;
   updatedDescriptionsCount: number;
+  driftedDescriptionsCount: number;
+  keptStatusSkips?: KeptStatusSkip[];
 }> {
   if (
     !mapping.companyId ||
@@ -15265,13 +15390,17 @@ async function synchronizePaperclipIssueStatuses(
     return {
       updatedStatusesCount: 0,
       updatedLabelsCount: 0,
-      updatedDescriptionsCount: 0
+      updatedDescriptionsCount: 0,
+      driftedDescriptionsCount: 0,
+      keptStatusSkips: []
     };
   }
 
+  const keptStatusSkips: KeptStatusSkip[] = [];
   let updatedStatusesCount = 0;
   let updatedLabelsCount = 0;
   let updatedDescriptionsCount = 0;
+  let driftedDescriptionsCount = 0;
   let completedIssueCount = 0;
   const totalIssueCount = importedIssues.length;
   const queuedIssueWakeups: Array<{
@@ -15330,19 +15459,17 @@ async function synchronizePaperclipIssueStatuses(
           repositoryUrl: repository.url,
           githubIssueNumber: githubIssue.number
         });
-        if (
-          await synchronizePaperclipIssueDescription(
-            ctx,
-            {
-              companyId: mapping.companyId,
-              issueId: importedIssue.paperclipIssueId,
-              currentDescription,
-              githubIssue,
-              linkedPullRequestNumbers: warmedLinkedPullRequestNumbers,
-              paperclipApiBaseUrl
-            }
-          )
-        ) {
+        const warmedDescriptionResult = await synchronizePaperclipIssueDescriptionWithDriftGuard(ctx, {
+          companyId: mapping.companyId,
+          importedIssue,
+          currentDescription,
+          githubIssue,
+          linkedPullRequestNumbers: warmedLinkedPullRequestNumbers,
+          paperclipApiBaseUrl,
+          persistImportRegistry
+        });
+        let descriptionDrifted = warmedDescriptionResult.drifted;
+        if (warmedDescriptionResult.updated) {
           descriptionUpdated = true;
           currentDescription = buildPaperclipIssueDescription(githubIssue, warmedLinkedPullRequestNumbers);
         }
@@ -15370,19 +15497,17 @@ async function synchronizePaperclipIssueStatuses(
           repositoryUrl: repository.url,
           githubIssueNumber: githubIssue.number
         });
-        if (
-          await synchronizePaperclipIssueDescription(
-            ctx,
-            {
-              companyId: mapping.companyId,
-              issueId: importedIssue.paperclipIssueId,
-              currentDescription,
-              githubIssue,
-              linkedPullRequestNumbers: snapshotLinkedPullRequestNumbers,
-              paperclipApiBaseUrl
-            }
-          )
-        ) {
+        const snapshotDescriptionResult = await synchronizePaperclipIssueDescriptionWithDriftGuard(ctx, {
+          companyId: mapping.companyId,
+          importedIssue,
+          currentDescription,
+          githubIssue,
+          linkedPullRequestNumbers: snapshotLinkedPullRequestNumbers,
+          paperclipApiBaseUrl,
+          persistImportRegistry
+        });
+        descriptionDrifted = descriptionDrifted || snapshotDescriptionResult.drifted;
+        if (snapshotDescriptionResult.updated) {
           descriptionUpdated = true;
           currentDescription = buildPaperclipIssueDescription(githubIssue, snapshotLinkedPullRequestNumbers);
         }
@@ -15390,6 +15515,9 @@ async function synchronizePaperclipIssueStatuses(
 
       if (descriptionUpdated) {
         updatedDescriptionsCount += 1;
+      }
+      if (descriptionDrifted) {
+        driftedDescriptionsCount += 1;
       }
 
         if (!paperclipIssue || !snapshot) {
@@ -15612,6 +15740,24 @@ async function synchronizePaperclipIssueStatuses(
             advancedSettings,
             followThroughAssigneeAgentId: transitionFollowThroughAssigneeAgentId
           });
+      // Paperclip rejects in_progress for an unassigned issue. Imported issues are created unassigned
+      // on purpose, so keep the current status and report a skip instead of a sync error. A configured
+      // default/executor assignee resolves above and keeps the normal path.
+      if (
+        nextStatus === 'in_progress'
+        && paperclipIssue.status !== 'in_progress'
+        && !paperclipIssueSyncContext.assignee
+        && !nextTransitionAssignee
+      ) {
+        const keptSkip = buildInProgressNeedsAssigneeSkip({
+          repositoryUrl: repository.url,
+          githubIssueNumber: githubIssue.number,
+          keptStatus: paperclipIssue.status
+        });
+        keptStatusSkips.push(keptSkip);
+        ctx.logger.info('GitHub Sync kept the Paperclip issue status.', { ...keptSkip });
+        nextStatus = paperclipIssue.status;
+      }
       const shouldClearTransitionAssignee =
         nextStatus === 'in_review'
         && (nextTransitionAssignee === null || shouldPreserveMaintainerWaitRouting);
@@ -15835,7 +15981,9 @@ async function synchronizePaperclipIssueStatuses(
   return {
     updatedStatusesCount,
     updatedLabelsCount,
-    updatedDescriptionsCount
+    updatedDescriptionsCount,
+    driftedDescriptionsCount,
+    keptStatusSkips
   };
 }
 
@@ -21897,6 +22045,8 @@ async function performSync(
   let updatedStatusesCount = 0;
   let updatedLabelsCount = 0;
   let updatedDescriptionsCount = 0;
+  let driftedDescriptionsCount = 0;
+  const keptStatusSkips: KeptStatusSkip[] = [];
   const recoverableFailures: SyncProcessingFailure[] = [];
   const nextRegistry = [...importRegistry];
   const companyLabelDirectoryCache = new Map<string, PaperclipLabelDirectory>();
@@ -22063,6 +22213,7 @@ async function performSync(
   }
 
   const repositoryPlans: RepositorySyncPlan[] = [];
+  const skippedByAgeEntries: Array<{ repositoryUrl: string; skippedCount: number; maxAgeDays: number }> = [];
 
   try {
     await throwIfSyncCancelled();
@@ -22131,9 +22282,37 @@ async function performSync(
         });
         const advancedSettings = getCompanyAdvancedSettings(settings, mapping.companyId);
         const eligibleIssues = allIssues.filter((issue) => !shouldIgnoreGitHubIssue(issue, advancedSettings));
-        const issues = (await listRepositoryIssuesForImport(eligibleIssues)).filter((issue) =>
+        const importCandidates = (await listRepositoryIssuesForImport(eligibleIssues)).filter((issue) =>
           doesGitHubIssueMatchTarget(issue, options.target)
         );
+        const importMaxAgeDays = resolveImportMaxAgeDays(mapping.importMaxAgeDays, advancedSettings.importMaxAgeDays);
+        const exemptIssueIds = new Set<number>(importedIssueRecords.map((entry) => entry.githubIssueId));
+        const exemptIssueUrls = new Set<string>();
+        if (importMaxAgeDays !== undefined) {
+          for (const record of await listGitHubIssueLinkRecords(ctx)) {
+            if (doesGitHubIssueLinkRecordMatchMapping(record, mapping)) {
+              exemptIssueUrls.add(record.data.githubIssueUrl);
+            }
+          }
+        }
+        const { eligible: issues, skippedByAge } = partitionIssuesByImportAge({
+          issues: importCandidates,
+          maxAgeDays: options.target?.kind === 'issue' ? undefined : importMaxAgeDays,
+          now: new Date(),
+          isExempt: (issue) => exemptIssueIds.has(issue.id) || exemptIssueUrls.has(issue.htmlUrl)
+        });
+        if (skippedByAge.length > 0 && importMaxAgeDays !== undefined) {
+          skippedByAgeEntries.push({
+            repositoryUrl: repository.url,
+            skippedCount: skippedByAge.length,
+            maxAgeDays: importMaxAgeDays
+          });
+          ctx.logger.info('GitHub sync skipped open issues older than the import age limit.', {
+            repositoryUrl: repository.url,
+            skippedCount: skippedByAge.length,
+            importMaxAgeDays
+          });
+        }
         const allIssuesById = new Map(eligibleIssues.map((issue) => [issue.id, issue] as const));
         const importRegistryByIssueId = new Map(
           importedIssueRecords.map((entry) => [entry.githubIssueId, entry])
@@ -22174,7 +22353,9 @@ async function performSync(
           issues,
           allIssuesById,
           pullRequestLinks,
-          trackedIssueCount
+          trackedIssueCount,
+          skippedByAgeCount: skippedByAge.length,
+          ...(importMaxAgeDays !== undefined ? { importMaxAgeDays } : {})
         });
       } catch (error) {
         if (error instanceof SyncCancellationError || isGitHubRateLimitError(error)) {
@@ -22482,6 +22663,8 @@ async function performSync(
         updatedStatusesCount += synchronizationResult.updatedStatusesCount;
         updatedLabelsCount += synchronizationResult.updatedLabelsCount;
         updatedDescriptionsCount += synchronizationResult.updatedDescriptionsCount;
+        driftedDescriptionsCount += synchronizationResult.driftedDescriptionsCount ?? 0;
+        keptStatusSkips.push(...(synchronizationResult.keptStatusSkips ?? []));
 
         const pullRequestSynchronizationResult = await synchronizePaperclipPullRequestIssueStatuses(
           ctx,
@@ -22660,6 +22843,8 @@ async function performSync(
         updatedStatusesCount += synchronizationResult.updatedStatusesCount;
         updatedLabelsCount += synchronizationResult.updatedLabelsCount;
         updatedDescriptionsCount += synchronizationResult.updatedDescriptionsCount;
+        driftedDescriptionsCount += synchronizationResult.driftedDescriptionsCount ?? 0;
+        keptStatusSkips.push(...(synchronizationResult.keptStatusSkips ?? []));
       } catch (error) {
         if (error instanceof SyncCancellationError || isGitHubRateLimitError(error)) {
           throw error;
@@ -22776,9 +22961,10 @@ async function performSync(
       return materializeScopedSettings(next, config, targetCompanyId);
     }
 
+    const skippedByAgeSummary = formatSkippedByAgeSummary(skippedByAgeEntries);
     const nextSyncState = {
       status: 'success' as const,
-      message: `${options.target ? `GitHub sync for ${options.target.displayLabel} is complete. ` : 'Sync complete. '}Imported ${createdIssuesCount} issues, updated ${updatedStatusesCount} issue status${updatedStatusesCount === 1 ? '' : 'es'}, updated ${updatedLabelsCount} issue label set${updatedLabelsCount === 1 ? '' : 's'}, updated ${updatedDescriptionsCount} issue description${updatedDescriptionsCount === 1 ? '' : 's'}, and skipped ${skippedIssuesCount} already-synced issue${skippedIssuesCount === 1 ? '' : 's'}.`,
+      message: `${options.target ? `GitHub sync for ${options.target.displayLabel} is complete. ` : 'Sync complete. '}Imported ${createdIssuesCount} issues, updated ${updatedStatusesCount} issue status${updatedStatusesCount === 1 ? '' : 'es'}, updated ${updatedLabelsCount} issue label set${updatedLabelsCount === 1 ? '' : 's'}, updated ${updatedDescriptionsCount} issue description${updatedDescriptionsCount === 1 ? '' : 's'}${driftedDescriptionsCount > 0 ? `, left ${driftedDescriptionsCount} drifted issue description${driftedDescriptionsCount === 1 ? '' : 's'} untouched` : ''}${keptStatusSkips.length > 0 ? `, kept ${keptStatusSkips.length} issue status${keptStatusSkips.length === 1 ? '' : 'es'} unchanged (${formatKeptStatusSkipSummary(keptStatusSkips)})` : ''}, and skipped ${skippedIssuesCount} already-synced issue${skippedIssuesCount === 1 ? '' : 's'}.${skippedByAgeSummary ? ` Age filter: ${skippedByAgeSummary}.` : ''}`,
       checkedAt: new Date().toISOString(),
       syncedIssuesCount,
       createdIssuesCount,
@@ -24954,6 +25140,31 @@ const plugin = definePlugin({
           });
     });
 
+    ctx.actions.register('issue.acceptGitHubDescription', async (input, actionContext) => {
+      const record = normalizeActionRecord(input, actionContext);
+      const companyId = normalizeCompanyId(record.companyId);
+      const issueId = normalizeOptionalString(record.issueId);
+      if (!companyId || !issueId) {
+        throw new Error('companyId and issueId are required.');
+      }
+
+      const registry = normalizeImportRegistry(await ctx.state.get(IMPORT_REGISTRY_SCOPE));
+      const entry = registry.find((candidate) => candidate.paperclipIssueId === issueId);
+      if (!entry) {
+        throw new Error('This Paperclip issue is not a synced GitHub issue.');
+      }
+      const paperclipIssue = await ctx.issues.get(issueId, companyId);
+      if (!paperclipIssue) {
+        throw new Error('Paperclip issue not found.');
+      }
+
+      // Adopt the current Paperclip text as the baseline. The next sync sees no edit and applies the GitHub text.
+      entry.descriptionHash = hashDescription(paperclipIssue.description);
+      delete entry.descriptionDriftKey;
+      await ctx.state.set(IMPORT_REGISTRY_SCOPE, registry);
+      return { accepted: true };
+    });
+
     ctx.actions.register('issue.unlinkGitHubItem', async (input, actionContext) => {
       const record = normalizeActionRecord(input, actionContext);
       const companyId = normalizeCompanyId(record.companyId);
@@ -25012,6 +25223,21 @@ const plugin = definePlugin({
         !requestedCompanyId && 'githubTokenLogin' in record
           ? requestedGitHubTokenLogin
           : previous.githubTokenLogin;
+      if (hasMappingsPatch && Array.isArray(record.mappings)) {
+        for (const mappingInput of record.mappings) {
+          const mappingRecord = mappingInput && typeof mappingInput === 'object' ? mappingInput as Record<string, unknown> : {};
+          const validation = validateImportMaxAgeDays(mappingRecord.importMaxAgeDays);
+          if (!validation.valid) {
+            throw new Error(validation.error);
+          }
+        }
+      }
+      if (hasAdvancedSettingsPatch && record.advancedSettings && typeof record.advancedSettings === 'object') {
+        const validation = validateImportMaxAgeDays((record.advancedSettings as Record<string, unknown>).importMaxAgeDays);
+        if (!validation.valid) {
+          throw new Error(validation.error);
+        }
+      }
       const inputMappings = hasMappingsPatch ? normalizeMappings(record.mappings) : previous.mappings;
       const nextCompanyAdvancedSettingsByCompanyId = {
         ...(previous.companyAdvancedSettingsByCompanyId ?? {})
@@ -25069,7 +25295,8 @@ const plugin = definePlugin({
         repositoryUrl: parseRepositoryReference(mapping.repositoryUrl)?.url ?? mapping.repositoryUrl.trim(),
         paperclipProjectName: mapping.paperclipProjectName.trim(),
         paperclipProjectId: mapping.paperclipProjectId,
-        companyId: mapping.companyId
+        companyId: mapping.companyId,
+        ...(mapping.importMaxAgeDays !== undefined ? { importMaxAgeDays: mapping.importMaxAgeDays } : {})
       }));
       const materializedCurrent = materializeScopedSettings(current, config, requestedCompanyId);
       const next = sanitizeSettingsForCurrentSetup({
