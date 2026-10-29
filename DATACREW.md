@@ -13,4 +13,4 @@ This is a fork of [alvarosanchez/paperclip-github-plugin](https://github.com/alv
 - Installed on bonker's Paperclip from a local path: build with `npm ci && npm run build`, copy `dist`, `package.json` and a production `node_modules` to `/paperclip/plugin-src/github-sync`, then `POST /api/plugins/install` with `isLocalPath: true`.
 - Scheduled sync stays off unless a repo is mapped to a project. Mapping a repo imports all of its open issues.
 - Upstream issues #195 and #196 ("company context is required") only appear while no repo is mapped. With a mapping the job runs scoped and the errors stop (checked on Paperclip v2026.1012.0, plugin 0.18.0).
-- Linking an issue only works for the repo mapped to that issue's project.
+- Linking an issue (`issue.linkGitHubItem`, `link_github_item`) works for any named repository, mapped or not, so no repo needs mapping (and no backlog imported) just to link one issue. Needs a token with access to that repo.
