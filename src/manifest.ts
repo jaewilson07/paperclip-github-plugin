@@ -97,6 +97,12 @@ export const manifest: PaperclipPluginManifestV1 = {
       displayName: 'Sync GitHub issues',
       description: 'Checks for GitHub issue updates and syncs them on the configured cadence.',
       schedule: SCHEDULE_TICK_CRON
+    },
+    {
+      jobKey: 'push.ready-for-agent',
+      displayName: 'Push ready-for-agent issues',
+      description: 'Pushes Paperclip issues labelled ready-for-agent that have a project repository and no GitHub link.',
+      schedule: SCHEDULE_TICK_CRON
     }
   ],
   apiRoutes: [

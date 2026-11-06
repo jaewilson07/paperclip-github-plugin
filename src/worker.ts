@@ -49,6 +49,12 @@ import {
   type ForgeLinkStore
 } from './forge-link.ts';
 import {
+  pushNow,
+  runPushOnLabelTick,
+  type PushOnLabelDeps,
+  type PushOnLabelIssue
+} from './push-on-label.ts';
+import {
   bodyHasPushMarker,
   PushIssueRefusedError,
   pushIssueToGitHub,
@@ -70,6 +76,11 @@ let createPullRequestBranchPublisher: CreatePullRequestBranchPublisher = publish
 const SETTINGS_SCOPE = {
   scopeKind: 'instance' as const,
   stateKey: 'paperclip-github-plugin-settings'
+};
+
+const PUSH_FAILURE_SCOPE = {
+  scopeKind: 'instance' as const,
+  stateKey: 'paperclip-github-plugin-push-on-label-failures'
 };
 
 const SYNC_STATE_SCOPE = {
@@ -12622,6 +12633,72 @@ async function pushPaperclipIssueToGitHub(
   }
 
   return { ...result, repositoryUrl: repository?.url ?? `https://github.com/${result.link.repository}` };
+}
+
+function createPushOnLabelDeps(ctx: PluginSetupContext, companyId: string): PushOnLabelDeps {
+  const toIssue = (issue: Issue): PushOnLabelIssue => ({
+    id: issue.id,
+    identifier: issue.identifier ?? null,
+    status: issue.status,
+    projectId: typeof issue.projectId === 'string' && issue.projectId.trim() ? issue.projectId.trim() : null,
+    labels: Array.isArray(issue.labels) ? issue.labels.map((label) => ({ name: label.name })) : null
+  });
+  const readFailures = async (): Promise<Record<string, string>> => {
+    const raw = await ctx.state.get(PUSH_FAILURE_SCOPE);
+    return raw && typeof raw === 'object' ? { ...(raw as Record<string, string>) } : {};
+  };
+
+  return {
+    async listIssues() {
+      const issues: PushOnLabelIssue[] = [];
+      for (let offset = 0; ; ) {
+        const page = await ctx.issues.list({ companyId, limit: PAPERCLIP_LABEL_PAGE_SIZE, offset });
+        issues.push(...page.map(toIssue));
+        if (page.length < PAPERCLIP_LABEL_PAGE_SIZE) {
+          return issues;
+        }
+        offset += page.length;
+      }
+    },
+    async getIssue(issueId) {
+      const issue = await ctx.issues.get(issueId, companyId);
+      return issue ? toIssue(issue) : null;
+    },
+    async loadLabels(issueId) {
+      const issue = await ctx.issues.get(issueId, companyId);
+      return (issue?.labels ?? []).map((label) => label.name);
+    },
+    async hasLink(issueId) {
+      const records = await listGitHubIssueLinkRecords(ctx, { paperclipIssueId: issueId });
+      return records.some((record) => record.status !== 'unlinked' && (!record.data.companyId || record.data.companyId === companyId));
+    },
+    async projectHasRepository(projectId) {
+      const settings = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
+      return (await resolveProjectScopedMappings(ctx, settings.mappings, { companyId, projectId })).length > 0;
+    },
+    async push(issueId) {
+      const result = await pushPaperclipIssueToGitHub(ctx, { companyId, issueId });
+      return { number: result.link.number, url: result.link.url };
+    },
+    async lastReportedFailure(issueId) {
+      return (await readFailures())[issueId];
+    },
+    async reportFailure(issueId, message) {
+      await ctx.issues.createComment(
+        issueId,
+        `Push to GitHub failed: ${message}\n\nIt will be retried on the next tick. No GitHub link was stored.`,
+        companyId
+      );
+      await ctx.state.set(PUSH_FAILURE_SCOPE, { ...(await readFailures()), [issueId]: message });
+    },
+    async clearFailure(issueId) {
+      const failures = await readFailures();
+      if (issueId in failures) {
+        delete failures[issueId];
+        await ctx.state.set(PUSH_FAILURE_SCOPE, failures);
+      }
+    }
+  };
 }
 
 function describePushResult(
@@ -25245,6 +25322,17 @@ const plugin = definePlugin({
       }));
     });
 
+    ctx.actions.register('issue.pushNowIfReady', async (input, actionContext) => {
+      const record = normalizeActionRecord(input, actionContext);
+      const companyId = normalizeCompanyId(record.companyId);
+      const issueId = normalizeOptionalString(record.issueId);
+      if (!companyId || !issueId) {
+        throw new Error('companyId and issueId are required.');
+      }
+
+      return { ...(await pushNow(createPushOnLabelDeps(ctx, companyId), issueId)) };
+    });
+
     ctx.actions.register('issue.unlinkGitHubItem', async (input, actionContext) => {
       const record = normalizeActionRecord(input, actionContext);
       const companyId = normalizeCompanyId(record.companyId);
@@ -25690,6 +25778,25 @@ const plugin = definePlugin({
     });
 
     registerGitHubAgentTools(ctx);
+
+    ctx.jobs.register('push.ready-for-agent', async () => {
+      const settings = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
+      for (const target of await listScheduledSyncTargets(ctx, settings)) {
+        const companyId = normalizeCompanyId(target?.companyId);
+        if (!companyId) {
+          continue;
+        }
+        try {
+          await runPushOnLabelTick(createPushOnLabelDeps(ctx, companyId));
+        } catch (error) {
+          // A company that cannot be read must not stop the tick for the others.
+          ctx.logger.warn('Push-on-label tick failed for a company.', {
+            companyId,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
+    });
 
     ctx.jobs.register('sync.github-issues', async (job) => {
       const settings = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
