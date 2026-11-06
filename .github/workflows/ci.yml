@@ -5,6 +5,12 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+
+# Superseded PR heads are cancelled; a run on main is never cancelled.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   verify:
@@ -37,3 +43,21 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+  # The only check branch protection and safe_merge.py need to require. Adding or
+  # renaming a job above never touches branch protection again. This repo is
+  # public, so it stays on GitHub-hosted runners (never self-hosted: fork PRs).
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [verify]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All required jobs passed or were skipped
+        env:
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          if [ "$FAILED" = "true" ]; then
+            echo "::error::A CI job failed or was cancelled."
+            exit 1
+          fi
