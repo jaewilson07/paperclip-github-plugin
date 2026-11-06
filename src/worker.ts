@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer';
+import { runDetachedFromInvocation } from './invocation-detach.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { buildDescriptionDriftComment, decideDescriptionDrift, hashDescription } from './description-drift.ts';
 import {
@@ -23116,7 +23117,9 @@ async function startSync(
 
   await setSyncCancellationRequest(ctx, null);
 
-  const runningStatePromise = (async () => {
+  // Detach from the host invocation that started this sync (see invocation-detach.ts): it can
+  // outlive the action RPC, and host calls echoing the expired invocation id are rejected.
+  const runningStatePromise = runDetachedFromInvocation(async () => {
     const syncableMappings = getSyncableMappingsForTarget(currentSettings.mappings, options.target);
     const syncState = createRunningSyncState(currentSettings.syncState, trigger, {
       syncedIssuesCount: 0,
@@ -23135,9 +23138,9 @@ async function startSync(
     };
     activeRunningSyncCompanyId = targetCompanyId;
     return saveSettingsSyncState(ctx, currentSettings, syncState, targetCompanyId);
-  })();
+  });
 
-  activeSyncPromise = (async () => {
+  activeSyncPromise = runDetachedFromInvocation(async () => {
     try {
       await runningStatePromise;
       return await performSync(ctx, trigger, {
@@ -23154,7 +23157,7 @@ async function startSync(
       activeRunningSyncCompanyId = undefined;
       activeSyncPromise = null;
     }
-  })();
+  });
 
   if (options.awaitCompletion) {
     return activeSyncPromise;
